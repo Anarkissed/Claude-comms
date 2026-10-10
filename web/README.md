@@ -7,7 +7,7 @@ Your approval desk in a browser, and on your phone over home Wi-Fi. It's one Pyt
 /usr/bin/python3 server.py --lan --open    # plus your phone: scan the QR printed in the Terminal
 ```
 
-On macOS you can double-click `Agent Comms.command` or `Agent Comms (phone).command` instead. Keep the Terminal window open while you use it; closing it stops the desk.
+On macOS you can double-click `Agent Comms.command` or `Agent Comms (phone).command` instead; on Windows, `Agent Comms.bat` or `Agent Comms (phone).bat` (they use `py` or `python`). Keep the Terminal window open while you use it; closing it stops the desk.
 
 - **Folder:** `AGENT_COMMS_ROOT`, default `~/agent-comms`.
 - **Desk state:** what you've seen and held is kept in `~/.claude/agent-comms-web/state.json` (`AGENT_COMMS_WEB_STATE` to change). Use either this desk or the `/comms` pane for Hold, or a message may be announced twice.

@@ -172,8 +172,17 @@ def write_atomic(directory: str, name: str, text: str, replace: bool = False) ->
         if replace:
             os.replace(temp, final)
         else:
-            os.link(temp, final)
-            os.unlink(temp)
+            try:
+                os.link(temp, final)  # FileExistsError if it is there: a message is never replaced
+                os.unlink(temp)
+            except FileExistsError:
+                raise
+            except OSError:
+                # no hard links on this drive (FAT/exFAT): check, then rename. On Windows os.rename itself
+                # refuses an existing name; elsewhere the check covers it (names carry 24 random bits)
+                if os.path.exists(final):
+                    raise FileExistsError(final)
+                os.rename(temp, final)
     finally:
         if os.path.exists(temp):
             os.unlink(temp)

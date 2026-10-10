@@ -410,5 +410,24 @@ class ReviewerModeAndDirectTests(World):
         self.assertTrue(self.folder.post("direct", "358", "note", "x").startswith("Not sent"))
 
 
+
+class NoHardLinkTests(World):
+    def test_a_drive_without_hard_links_still_writes_atomically_and_never_clobbers(self):
+        real_link = os.link
+        def no_links(*args, **kwargs):
+            raise OSError(1, "Operation not permitted")
+        os.link = no_links
+        try:
+            d = self.folder.channel_dir("358", "messages")
+            core.write_atomic(d, "a.json", "one\n")
+            with self.assertRaises(FileExistsError):
+                core.write_atomic(d, "a.json", "two\n")
+            with open(os.path.join(d, "a.json")) as h:
+                self.assertEqual(h.read(), "one\n")
+            self.assertEqual(sorted(os.listdir(d)), ["a.json"])
+        finally:
+            os.link = real_link
+
+
 if __name__ == "__main__":
     unittest.main()

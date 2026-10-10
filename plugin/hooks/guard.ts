@@ -63,12 +63,28 @@ export const stringsUnder = (input: unknown, keys: ReadonlySet<string>, depth = 
   return found
 }
 
-/** `~` and `$HOME` expanded, made absolute under `cwd`, `.` and `..` folded. */
+/** Windows backslashes as forward slashes: every path here is compared in that one spelling. */
+export const toSlashes = (path: string): string => path.replace(/\\/g, '/')
+
+/** `/x` (macOS, Linux) or `C:/x` (Windows, after toSlashes). */
+const isAbsolutePath = (path: string): boolean => path.startsWith('/') || /^[A-Za-z]:\//.test(path)
+
+/**
+ * `~`, `$HOME`, `%USERPROFILE%` and `$env:USERPROFILE` expanded, made absolute
+ * under `cwd`, `.` and `..` folded; a Windows path keeps its drive (`C:/…`).
+ */
 export const absolutize = (path: string, cwd: string, home: string): string => {
-  let p = path.trim()
-  if (p === '~' || p.startsWith('~/')) p = home + p.slice(1)
-  p = p.replace(/^\$\{?HOME\}?(?=\/|$)/, home)
-  if (!p.startsWith('/')) p = `${cwd.replace(/\/+$/, '')}/${p}`
+  const h = toSlashes(home)
+  let p = toSlashes(path.trim())
+  if (p === '~' || p.startsWith('~/')) p = h + p.slice(1)
+  p = p.replace(/^(\$\{?HOME\}?|%USERPROFILE%|\$env:USERPROFILE)(?=\/|$)/i, h)
+  if (!isAbsolutePath(p)) p = `${toSlashes(cwd).replace(/\/+$/, '')}/${p}`
+  let drive = ''
+  const withDrive = /^([A-Za-z]:)(\/.*)?$/.exec(p)
+  if (withDrive) {
+    drive = (withDrive[1] ?? '').toUpperCase()
+    p = withDrive[2] ?? '/'
+  }
   const out: string[] = []
   for (const part of p.split('/')) {
     if (part === '' || part === '.') continue
@@ -76,11 +92,17 @@ export const absolutize = (path: string, cwd: string, home: string): string => {
     else out.push(part)
   }
 
-  return `/${out.join('/')}`
+  return `${drive}/${out.join('/')}`
 }
 
-export const isInside = (path: string, root: string): boolean =>
-  path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`)
+/** Whether `path` is `root` or under it; a Windows root (`C:/…`) compares without case, as its file system does. */
+export const isInside = (path: string, root: string): boolean => {
+  const fold = /^[A-Za-z]:\//.test(root) ? (s: string) => s.toLowerCase() : (s: string) => s
+  const p = fold(toSlashes(path))
+  const r = fold(toSlashes(root))
+
+  return p === r || p.startsWith(r.endsWith('/') ? r : `${r}/`)
+}
 
 /** The spellings of the root a command may carry, longest first. */
 export const rootSpellings = (roots: readonly string[], home: string): string[] => {
@@ -96,7 +118,17 @@ export const rootSpellings = (roots: readonly string[], home: string): string[] 
     // the last two components (`me/agent-comms` for ~/agent-comms): a relative spelling
     const parts = root.split('/').filter(Boolean)
     if (parts.length >= 2) out.add(parts.slice(-2).join('/'))
+    // Windows: %USERPROFILE% and PowerShell's $env:USERPROFILE, and Git Bash's /c/Users/… for C:/Users/…
+    if (root.toLowerCase().startsWith(`${home.toLowerCase()}/`) && /^[A-Za-z]:\//.test(home)) {
+      const rest = root.slice(home.length)
+      out.add(`%USERPROFILE%${rest}`)
+      out.add(`$env:USERPROFILE${rest}`)
+    }
+    const drive = /^([A-Za-z]):(\/.*)$/.exec(root)
+    if (drive) out.add(`/${(drive[1] ?? '').toLowerCase()}${drive[2] ?? ''}`)
   }
+  // each spelling with Windows backslashes too (`C:\\Users\\me\\agent-comms`)
+  for (const spelling of [...out]) if (spelling.includes('/')) out.add(spelling.replace(/\//g, '\\'))
 
   return [...out].sort((a, b) => b.length - a.length)
 }
@@ -109,10 +141,12 @@ export const rootSpellings = (roots: readonly string[], home: string): string[] 
  * mentioned the name (a commit message, a README heading).
  */
 export const commandMentionsRoot = (command: string, spellings: readonly string[], base: string): boolean => {
-  if (spellings.some(s => command.includes(s))) return true
+  // Windows paths are not case-sensitive: compare the command and the spellings without case there
+  const lower = command.toLowerCase()
+  if (spellings.some(s => command.includes(s) || (/^[A-Za-z]:|%USERPROFILE%|\$env:/i.test(s) && lower.includes(s.toLowerCase())))) return true
   const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-  return new RegExp(`(^|[\\s;&|(<>'"=])(\\./)?${escaped}/`).test(command)
+  return new RegExp(`(^|[\\s;&|(<>'"=])(\\.[/\\\\])?${escaped}[/\\\\]`).test(command)
 }
 
 export const denyText = (root: string): string =>

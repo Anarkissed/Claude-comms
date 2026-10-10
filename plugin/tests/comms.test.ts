@@ -11,6 +11,7 @@ const DEFAULT_CONFIG = {
   ...PUBLIC_DEFAULT,
   channels: ['358', '354', '361', '362'].map(id => ({ id, members: ['reviewer', id] })),
 }
+const WIN_ROOT = 'C:/Users/me/agent-comms'
 const HOME = '/w/home'
 const ROOT = '/w/agent-comms'
 const CWD = '/w/proj'
@@ -36,14 +37,17 @@ type World = {
   links: Map<string, string>
   ran: string[][]
   put: (path: string, text: string) => void
+  /** Folders the mod made (.keep markers). */
+  keeps: Set<string>
 }
 
 const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/'
 const nameOf = (p: string) => p.slice(p.lastIndexOf('/') + 1)
 
-const world = (on: On, options: { identity?: string; config?: unknown; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; store?: Record<string, unknown> } = {}): World => {
+const world = (on: On, options: { identity?: string; config?: unknown; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; store?: Record<string, unknown>; windows?: true } = {}): World => {
   const files = new Map<string, string>()
-  const dirs = new Set<string>(['/', '/w', HOME, CWD])
+  const dirs = new Set<string>(['/', '/w', HOME, CWD, 'C:', 'C:/Users', 'C:/Users/me', 'C:/work'])
+  const root = options.windows ? WIN_ROOT : ROOT
   const mtimes = new Map<string, number>()
   let tick = 1
   const addDirs = (p: string) => {
@@ -55,10 +59,15 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     addDirs(p)
   }
   const links = new Map<string, string>()
-  const real = (p: string) => {
+  const real = (path: string) => {
+    // this kit runs on macOS, where the engine reads C:/… as relative to the plugin's folder; on a PC it is absolute
+    const drive = path.indexOf('/C:/')
+    const p = drive >= 0 ? path.slice(drive + 1) : path
     for (const [link, target] of links) if (p === link || p.startsWith(`${link}/`)) return target + p.slice(link.length)
     return p
   }
+  /** Folder markers (.keep), kept apart so tests that count messages do not count them. */
+  const keeps = new Set<string>()
   const w: World = {
     files,
     writes: [],
@@ -74,14 +83,19 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     links,
     ran: [],
     put: (path, text) => put(path, text),
+    keeps: undefined as unknown as Set<string>, // set just below
   }
   let statusText: string | undefined
+  w.keeps = keeps
 
-  if (options.config !== null) put(`${ROOT}/channels.json`, JSON.stringify(options.config ?? DEFAULT_CONFIG))
+  if (options.config !== null) put(`${root}/channels.json`, JSON.stringify(options.config ?? DEFAULT_CONFIG))
   w.clock = mock.clock(on, { now: T0 })
   mock.store(on, { ...(options.identity ? { [`identity:${SID}`]: options.identity } : {}), ...(options.store ?? {}) })
   // AGENT_COMMS_TEST_DELIVERY_SINK: this kit cannot answer session.append, so the mod logs each delivered row (see appendRow)
-  mock.env(on, { HOME, AGENT_COMMS_ROOT: ROOT, AGENT_COMMS_TEST_DELIVERY_SINK: '1' })
+  mock.env(on, options.windows
+    // Windows: no HOME, no AGENT_COMMS_ROOT (so the default C:/Users/me/agent-comms is what is tested)
+    ? { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\me', AGENT_COMMS_TEST_DELIVERY_SINK: '1' }
+    : { HOME, AGENT_COMMS_ROOT: ROOT, AGENT_COMMS_TEST_DELIVERY_SINK: '1' })
 
   const listDir = (path: string): FsEntry[] => {
     const p = real(path)
@@ -100,6 +114,11 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     return { value: text }
   })
   on('fs.write', ($, e) => {
+    if (e.path.endsWith('/.keep')) {
+      keeps.add(real(e.path))
+      addDirs(real(e.path))
+      return { value: undefined }
+    }
     const p = real(e.path)
     w.writes.push(p)
     put(p, e.text)
@@ -112,7 +131,7 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     w.lists.push(e.path)
     return { value: listDir(e.path) }
   })
-  on('fs.exists', ($, e) => ({ value: files.has(real(e.path)) || dirs.has(real(e.path)) }))
+  on('fs.exists', ($, e) => ({ value: files.has(real(e.path)) || dirs.has(real(e.path)) || keeps.has(real(e.path)) }))
   on('fs.stat', ($, e) => {
     const p = real(e.path)
     const isFile = files.has(p)
@@ -150,11 +169,31 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
       }
       return ok
     }
+    if (argv[0] === 'powershell.exe') {
+      const command = argv[argv.length - 1] ?? ''
+      const unquote = (q: string) => q.slice(1, -1).replace(/''/g, "'")
+      const move = /^Move-Item -LiteralPath ('(?:[^']|'')*') -Destination ('(?:[^']|'')*')( -Force)?$/.exec(command)
+      if (move) {
+        const from = unquote(move[1] ?? ''), to = unquote(move[2] ?? '')
+        const text = files.get(real(from))
+        if (text === undefined) return { ...ok, exitCode: 1, stderr: 'Cannot find path' }
+        if (!move[3] && files.has(real(to))) return { ...ok, exitCode: 1, stderr: 'Cannot create a file when that file already exists.' }
+        files.delete(real(from))
+        put(real(to), text)
+        return ok
+      }
+      const remove = /^Remove-Item -LiteralPath ('(?:[^']|'')*') -Force -ErrorAction SilentlyContinue$/.exec(command)
+      if (remove) {
+        files.delete(real(unquote(remove[1] ?? '')))
+        return ok
+      }
+      return { ...ok, exitCode: 1, stderr: `unexpected PowerShell: ${command}` }
+    }
     if (argv[0] === 'git') return { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository' }
     return { ...ok, exitCode: 127 }
   }
   on('session.id', () => ({ value: SID }))
-  on('session.cwd', () => ({ value: CWD }))
+  on('session.cwd', () => ({ value: options.windows ? 'C:\\work' : CWD }))
   on('prompt.submit', ($, e) => {
     w.prompts.push(e.text)
     return { text: e.text }
@@ -492,7 +531,7 @@ describe('6b. registering a new agent with /comms-as', () => {
     expect(cfg.channels).toEqual([...DEFAULT_CONFIG.channels, { id: '363', members: ['reviewer', '363'] }])
     expect(cfg.require_approval).toBe(true)
     expect(cfg.poll_seconds).toBe(15)
-    expect(w.ran.some(a => a[0] === '/bin/mkdir' && a.includes(msgDir('363')) && a.includes(apprDir('363')))).toBe(true)
+    expect(w.keeps.has(`${msgDir('363')}/.keep`) && w.keeps.has(`${apprDir('363')}/.keep`)).toBe(true)
     const notes = [...w.files.entries()].filter(([p]) => p.startsWith(`${msgDir('363')}/`))
     expect(notes).toHaveLength(1)
     const note = parse(notes[0]?.[1] ?? '', nameOf(notes[0]?.[0] ?? '').slice(0, -5))
@@ -517,7 +556,7 @@ describe('6b. registering a new agent with /comms-as', () => {
     expect(known.text).not.toContain('Registered')
     expect(w.files.get(`${ROOT}/channels.json`)).toBe(before)
     expect(w.ran.some(a => a[0] === '/bin/mv' && a[3] === `${ROOT}/channels.json`)).toBe(false)
-    expect(w.ran.some(a => a[0] === '/bin/mkdir' && a.includes(msgDir('358')))).toBe(true)
+    expect(w.keeps.has(`${msgDir('358')}/.keep`)).toBe(true)
   })
 
   test('before /comms-setup a new id is not registered and nothing is created', async ($, on) => {
@@ -1092,7 +1131,7 @@ describe('group chats (several agents and the reviewer)', () => {
     expect(made.text).toBe('Group #team is ready: reviewer, 354, 358. Messages to "all" reach everyone in it; each agent sees it beside its own channel.')
     const cfg = JSON.parse(w.files.get(`${ROOT}/channels.json`) ?? '{}')
     expect(cfg.channels).toEqual([...DEFAULT_CONFIG.channels, { id: 'team', members: ['reviewer', '354', '358'] }])
-    expect(w.ran.some(a => a[0] === '/bin/mkdir' && a.includes(msgDir('team')) && a.includes(apprDir('team')))).toBe(true)
+    expect(w.keeps.has(`${msgDir('team')}/.keep`) && w.keeps.has(`${apprDir('team')}/.keep`)).toBe(true)
     const notes = groupFiles(w)
     expect(notes).toHaveLength(1)
     expect(notes[0]).toMatchObject({ from: 'maintainer', to: 'all', kind: 'note' })
@@ -1240,5 +1279,53 @@ describe('reviewer as a Code session or a Chat agent; any agent name; #direct', 
   test('the public default: no agent channels, only #direct', async () => {
     expect(PUBLIC_DEFAULT.channels).toEqual([{ id: 'direct', members: ['reviewer', 'maintainer'] }])
     expect(PUBLIC_DEFAULT.reviewer_mode).toBe('code')
+  })
+})
+
+describe('Windows (the plugin on a PC)', () => {
+  const winMsg = (ch: string) => `${WIN_ROOT}/channels/${ch}/messages`
+  const winAppr = (ch: string) => `${WIN_ROOT}/channels/${ch}/approvals`
+
+  test('the default folder is %USERPROFILE%\\agent-comms; messages move with PowerShell, never /bin/mv', async ($, on) => {
+    const w = world(on, { identity: '358', windows: true })
+    await start($)
+    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'report', text: 'built on Windows' })
+    expect(denial(posted)).toBeUndefined()
+    const [path] = [...w.files.keys()].filter(p => p.startsWith(`${winMsg('358')}/`))
+    expect(parse(w.files.get(path ?? '') ?? '', nameOf(path ?? '').slice(0, -5))).toMatchObject({ ok: true })
+    expect(w.ran.some(a => a[0] === 'powershell.exe' && (a.at(-1) ?? '').startsWith('Move-Item -LiteralPath '))).toBe(true)
+    expect(w.ran.some(a => (a[0] ?? '').startsWith('/bin/'))).toBe(false)
+    expect([...w.files.keys()].some(p => p.endsWith('.tmp'))).toBe(false)
+  })
+
+  test('an approved reviewer message is delivered on Windows too', async ($, on) => {
+    const w = world(on, { identity: '358', windows: true })
+    const m = newMessage({ from: 'reviewer', to: '358', kind: 'ruling', body: 'ok on Windows', nowMs: T0 - 1000, hex: 'w1n001' })
+    put(w, `${winMsg('358')}/${m.id}.json`, format(m))
+    put(w, `${winAppr('358')}/${m.id}.json`, formatApproval({ id: m.id, by: 'maintainer', ts: '2026-10-03T12:00:02.000Z' }))
+    await start($)
+    await turn($, 1)
+    expect(w.appended.some(t => t.includes('ok on Windows'))).toBe(true)
+  })
+
+  test('the guard knows Windows spellings: backslashes, any case, %USERPROFILE%, Git Bash /c/…', async ($, on) => {
+    const w = world(on, { identity: '358', windows: true })
+    await start($)
+    const denied = [
+      await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\me\\agent-comms\\channels\\358\\approvals\\x.json', content: '{}' }),
+      await $.tool.call({ tool: 'Write', file_path: 'c:/users/ME/Agent-Comms/channels/358/approvals/y.json', content: '{}' }),
+      await $.tool.call({ tool: 'Write', file_path: '..\\Users\\me\\agent-comms\\channels\\358\\messages\\z.json', content: '{}' }),
+      await $.tool.call({ tool: 'Bash', command: 'del C:\\Users\\me\\agent-comms\\channels\\358\\messages\\a.json' }),
+      await $.tool.call({ tool: 'Bash', command: 'Remove-Item $env:USERPROFILE\\agent-comms\\channels -Recurse' }),
+      await $.tool.call({ tool: 'Bash', command: 'rm -rf /c/Users/me/agent-comms/channels' }),
+      await $.tool.call({ tool: 'Bash', command: 'type nul > %USERPROFILE%\\agent-comms\\channels\\358\\approvals\\b.json' }),
+    ]
+    for (const r of denied) expect(denial(r)).toContain('comms_post')
+    const allowed = [
+      await $.tool.call({ tool: 'Write', file_path: 'C:\\work\\notes.txt', content: 'fine' }),
+      await $.tool.call({ tool: 'Bash', command: 'dir C:\\work' }),
+    ]
+    for (const r of allowed) expect(denial(r)).toBeUndefined()
+    expect(w.files.has(`${winAppr('358')}/x.json`)).toBe(false)
   })
 })

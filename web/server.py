@@ -299,7 +299,19 @@ def serve(folder: core.Folder, port: int, token: str, lan: bool = False) -> Thre
     raise SystemExit(f"no free port between {port} and {port + 19}")
 
 
+def prepare_console() -> None:
+    """Windows: turn on colour codes in the console (the QR is drawn with them), and never let a
+    character the console cannot show (the emoji) stop the server."""
+    if os.name == "nt":
+        os.system("")  # enables VT processing in the classic Windows console
+    try:
+        sys.stdout.reconfigure(errors="replace")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+
+
 def main(argv: list) -> int:
+    prepare_console()
     port = 8765
     if "--port" in argv:
         port = int(argv[argv.index("--port") + 1])

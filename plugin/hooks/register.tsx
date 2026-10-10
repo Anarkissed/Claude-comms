@@ -45,6 +45,7 @@ import {
   PATH_KEYS,
   PERSON_ONLY_COMMAND,
   absolutize,
+  toSlashes,
   commandMentionsRoot,
   denyText,
   isInside,
@@ -126,6 +127,8 @@ let timerMs = 0
 let turnRunning = false
 /** Test seam (see appendRow): set from AGENT_COMMS_TEST_DELIVERY_SINK at init. */
 let testSink = false
+/** Windows: files move with PowerShell; paths are written C:/… */
+let windows = false
 let scanning: Promise<void> | undefined
 let delivering: Promise<void> | undefined
 const files = new Map<string, Map<string, CachedFile>>()
@@ -159,7 +162,9 @@ const readWoken = async ($: Engine): Promise<Set<string>> => {
 
 const init = async ($: Engine) => {
   sessionId = await $.session.id()
-  home = (await $.env.get('HOME')) ?? ''
+  windows = (await $.env.get('OS')) === 'Windows_NT'
+  // HOME on macOS and Linux; USERPROFILE on Windows (Git Bash may set HOME there too)
+  home = toSlashes((await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '')
   const configured = await $.env.get('AGENT_COMMS_ROOT')
   root = absolutize(configured ?? `${home}/agent-comms`, home || '/', home)
   testSink = (await $.env.get('AGENT_COMMS_TEST_DELIVERY_SINK')) === '1'
@@ -172,12 +177,12 @@ const resolveRealRoot = async ($: Engine): Promise<string | undefined> => {
   if (realRoot !== undefined) return realRoot
   const own = await $.fs.stat(root, { resolve: true }).catch(() => undefined)
   if (own?.realPath !== undefined) {
-    realRoot = own.realPath
+    realRoot = toSlashes(own.realPath)
     return realRoot
   }
   const up = await $.fs.stat(parent(root), { resolve: true }).catch(() => undefined)
 
-  return up?.realPath === undefined ? undefined : `${up.realPath.replace(/\/$/, '')}/${base(root)}`
+  return up?.realPath === undefined ? undefined : `${toSlashes(up.realPath).replace(/\/$/, '')}/${base(root)}`
 }
 
 // ---- files -----------------------------------------------------------
@@ -190,10 +195,41 @@ const listSafe = async ($: Engine, dir: string) => {
   }
 }
 
+/** A PowerShell single-quoted string: a ' inside it is written twice. */
+const psQuote = (text: string): string => `'${text.replace(/'/g, "''")}'`
+
+/**
+ * Renames `from` to `to`: `/bin/mv` on macOS and Linux (rename(2)), PowerShell's
+ * Move-Item on Windows (MoveFileEx). Without `replace`, an existing `to` is kept
+ * (`mv -n`; Move-Item refuses without -Force).
+ */
+const moveFile = (from: string, to: string, replace: boolean): readonly string[] =>
+  windows
+    ? ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', `Move-Item -LiteralPath ${psQuote(from)} -Destination ${psQuote(to)}${replace ? ' -Force' : ''}`]
+    : ['/bin/mv', replace ? '-f' : '-n', from, to]
+
+const removeFile = (path: string): readonly string[] =>
+  windows
+    ? ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', `Remove-Item -LiteralPath ${psQuote(path)} -Force -ErrorAction SilentlyContinue`]
+    : ['/bin/rm', '-f', path]
+
+/**
+ * Creates folders with no command at all: a hidden `.keep` file in each
+ * (writing creates the folders on the way). Readers skip dot-files.
+ */
+const ensureDirs = async ($: Engine, dirs: readonly string[]): Promise<string | undefined> => {
+  try {
+    for (const dir of dirs) if (!(await $.fs.exists(`${dir}/.keep`))) await $.fs.write(`${dir}/.keep`, '')
+    return undefined
+  } catch (error) {
+    return String(error)
+  }
+}
+
 /**
  * Writes `name` in `dir` so no reader sees half of it: a dot-named temp
- * file in the same folder, then a rename (`mv -n`, rename(2) on one file
- * system). Never replaces an existing file unless `replace` (channels.json).
+ * file in the same folder, then a rename (moveFile). Never replaces an
+ * existing file unless `replace` (channels.json).
  */
 const writeAtomic = async (
   $: Engine,
@@ -206,14 +242,13 @@ const writeAtomic = async (
   if (!replace && (await $.fs.exists(final))) return { ok: false, reason: `${name} already exists` }
   const temp = `${dir}/${tempNameFor(name, randomHex(4))}`
   await $.fs.write(temp, text)
-  const argv = replace ? ['/bin/mv', '-f', temp, final] : ['/bin/mv', '-n', temp, final]
-  const moved = await $.process.run(argv).catch(error => ({
+  const moved = await $.process.run(moveFile(temp, final, replace)).catch(error => ({
     exitCode: -1,
     stdout: '',
     stderr: String(error),
   }))
   if (moved.exitCode !== 0 || (await $.fs.exists(temp))) {
-    await $.process.run(['/bin/rm', '-f', temp]).catch(() => undefined)
+    await $.process.run(removeFile(temp)).catch(() => undefined)
 
     return { ok: false, reason: `rename failed: ${moved.stderr.trim() || `exit ${moved.exitCode}`}` }
   }
@@ -553,11 +588,11 @@ const placeReal = async ($: Engine, abs: string): Promise<string | undefined> =>
   for (let i = 0; i < 64; i += 1) {
     const stat = await $.fs.stat(current, { resolve: true }).catch(() => undefined)
     if (stat?.realPath !== undefined) {
-      const head = stat.realPath.replace(/\/$/, '')
+      const head = toSlashes(stat.realPath).replace(/\/$/, '')
 
       return rest.length === 0 ? head : `${head}/${rest.join('/')}`
     }
-    if (current === '/' || current === '') return undefined
+    if (current === '/' || current === '' || /^[A-Za-z]:\/?$/.test(current)) return undefined
     rest.unshift(base(current))
     current = parent(current)
   }
@@ -926,8 +961,8 @@ const setup = async ($: Engine): Promise<string> => {
     created.push(hadConfig ? 'merged channels.json' : 'wrote channels.json')
   }
   const dirs = cfg.channels.flatMap(c => [paths.messages(c.id), paths.approvals(c.id)])
-  const made = await $.process.run(['/bin/mkdir', '-p', ...dirs]).catch(() => undefined)
-  if (made === undefined || made.exitCode !== 0) return `could not create the channel folders: ${made?.stderr ?? 'mkdir did not run'}`
+  const failed = await ensureDirs($, dirs)
+  if (failed !== undefined) return `could not create the channel folders: ${failed}`
   created.push(`${dirs.length} channel folders`)
   realRoot = undefined
 
@@ -1001,8 +1036,8 @@ const createGroup = async ($: Engine, args: readonly string[]): Promise<string> 
   cfg = await loadConfig($)
   const group = cfg?.channels.find(c => c.id === name)
   if (cfg === undefined || group === undefined) return 'channels.json kept changing; the group was not added. Try again.'
-  const made = await $.process.run(['/bin/mkdir', '-p', paths.messages(name), paths.approvals(name)]).catch(() => undefined)
-  if (made === undefined || made.exitCode !== 0) return `Could not create the group's folders: ${made?.stderr.trim() || 'mkdir did not run'}`
+  const failed = await ensureDirs($, [paths.messages(name), paths.approvals(name)])
+  if (failed !== undefined) return `Could not create the group's folders: ${failed}`
   await writeSetupNotes($, cfg, [group])
   if (me !== undefined) await scan($)
 
@@ -1080,10 +1115,8 @@ const registerAgent = async ($: Engine, id: string): Promise<AgentRegistration> 
   if (mine.length === 0) return { ok: false, reason: `channels.json kept changing; ${id} was not added. Try again.` }
   config = cfg
   const dirs = mine.flatMap(c => [paths.messages(c.id), paths.approvals(c.id)])
-  const made = await $.process.run(['/bin/mkdir', '-p', ...dirs]).catch(() => undefined)
-  if (made === undefined || made.exitCode !== 0) {
-    return { ok: false, reason: `could not create the channel folders: ${made?.stderr.trim() || 'mkdir did not run'}` }
-  }
+  const failed = await ensureDirs($, dirs)
+  if (failed !== undefined) return { ok: false, reason: `could not create the channel folders: ${failed}` }
   const notes = await writeSetupNotes($, cfg, mine)
 
   return { ok: true, added, channels: mine, notes }

@@ -6,7 +6,7 @@
 
 Run several Claude Code agents on one project, have a reviewer (another Claude session) review their work, and stay in the loop: every message the reviewer sends to an agent waits for your **Approve** before the agent sees it. Agents and the reviewer write to each other through a plain folder of JSON files on your machine. There's no server in the cloud, no account and no network service, and you read and approve from a chat-style page on your Mac or your phone.
 
-> Independent community project. It is **not** made by, endorsed by or affiliated with Anthropic. It uses Claude Code's early-access plugin ("function hooks") API, which can change between Claude Code releases. Tested with Claude Code 2.1.293.
+> Independent community project. It is **not** made by, endorsed by or affiliated with Anthropic. It uses Claude Code's early-access plugin ("function hooks") API, which can change between Claude Code releases. Tested with Claude Code 2.1.293 on macOS. **Windows support is new and hasn't been tried on a real PC yet; please open an issue if something doesn't work.** See [PRIVACY.md](PRIVACY.md) for what it reads, writes and sends.
 
 ## What you get
 
@@ -32,7 +32,7 @@ Run several Claude Code agents on one project, have a reviewer (another Claude s
 
 ## Install
 
-You need Claude Code (terminal, desktop app or IDE) and, for the web desk, Python 3.9+ (on macOS, `/usr/bin/python3` is enough). Nothing else.
+You need Claude Code (terminal, desktop app or IDE) and, for the web desk, Python 3.9+. On macOS, `/usr/bin/python3` is enough; on Windows, install Python from python.org and tick "Add python.exe to PATH". Nothing else.
 
 1. Clone the repository somewhere outside your projects:
    ```bash
@@ -46,6 +46,8 @@ You need Claude Code (terminal, desktop app or IDE) and, for the web desk, Pytho
    }
    ```
    `CLAUDE_CODE_PLUGIN_DIR_WATCH=1` makes desktop-app sessions pick up plugin updates without a restart. Restart your sessions once.
+
+   **On Windows** the file is `%USERPROFILE%\.claude\settings.json`. Write the path with forward slashes, e.g. `"CLAUDE_CODE_PLUGIN_DIRS": "C:/Users/you/claude-comms/plugin"`. The comms folder defaults to `%USERPROFILE%\agent-comms`.
 3. In any session, run `/comms-setup`. It shows the folder (`~/agent-comms`; set `AGENT_COMMS_ROOT` to use another, outside any git repository), asks, then creates it with `channels.json` and #direct.
 
 ## Use
@@ -63,7 +65,7 @@ You need Claude Code (terminal, desktop app or IDE) and, for the web desk, Pytho
 
 ### The web and phone desk
 
-Double-click `web/Agent Comms.command` (this Mac only) or `web/Agent Comms (phone).command` (this Mac and your phone on the same Wi-Fi). Or run it from a terminal:
+Double-click `web/Agent Comms.command` (this Mac only) or `web/Agent Comms (phone).command` (this Mac and your phone on the same Wi-Fi). On Windows, double-click `web\Agent Comms.bat` or `web\Agent Comms (phone).bat`, and click **Allow access** if Windows Firewall asks. Or run it from a terminal:
 
 ```bash
 /usr/bin/python3 ~/claude-comms/web/server.py --open          # this Mac only
@@ -73,6 +75,17 @@ Double-click `web/Agent Comms.command` (this Mac only) or `web/Agent Comms (phon
 - **Mac only:** it listens on `127.0.0.1`, and the page needs a fresh secret key from the link printed in the Terminal.
 - **With your phone:** a QR code appears in the Terminal and on the Mac's page. Scan it and the phone pairs and opens the desk. Only home-network addresses are served, five wrong codes lock pairing, and the code changes after every pairing.
 - **Plain HTTP:** traffic between your phone and the Mac isn't encrypted on the Wi-Fi itself, so use it on a home network you trust.
+
+## What the plugin runs
+
+- **No network requests.**
+- **Local commands only**, all on the comms folder:
+  - **macOS / Linux:** `/bin/mv` to put each message in place in one step (no reader ever sees half a file), and `/bin/rm -f` to remove its own temporary file if that fails.
+  - **Windows:** PowerShell's `Move-Item` and `Remove-Item` for the same two jobs.
+  - **Everywhere:** `git rev-parse --is-inside-work-tree`, once during `/comms-setup`, so the folder isn't created inside a git repository.
+- **Folders** are created by writing an empty `.keep` file, with no command.
+- **Nothing else:** it never runs anything taken from a message, downloads nothing, and declares no MCP servers.
+- **One check on other tools:** a hook on Claude Code's tool calls refuses any model tool call that would write to the comms folder other than through `comms_post`. It checks real paths for file tools and, as a best effort, the command text for shell commands.
 
 ## The file format
 
@@ -113,7 +126,7 @@ For a reviewer that writes files itself, such as a Chat agent with file access:
 
 ## Development
 
-- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (66 tests). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
-- **Web:** `cd web && python3 -m unittest -v test_web` (28 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
+- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (69 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
+- **Web:** `cd web && python3 -m unittest -v test_web` (29 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
 
 Forks and pull requests are welcome. Released under the [MIT License](LICENSE).
