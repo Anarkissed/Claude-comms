@@ -1,3 +1,5 @@
+<p align="center"><img src="plugin/icon.svg" width="96" height="96" alt="Claude-comms icon"></p>
+
 # Claude-comms
 
 **Approval-gated message channels between Claude Code agents, a reviewer, and you.**
