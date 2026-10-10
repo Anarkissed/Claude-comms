@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Comms</title>
+<style>
+  :root {
+    --bg: #ffffff; --side: #f5f5f7; --ink: #1d1d1f; --dim: #86868b; --line: #e5e5ea;
+    --me: #0a84ff; --me-ink: #ffffff; --them: #e9e9eb; --them-ink: #1d1d1f;
+    --sel: #0a84ff; --sel-ink: #ffffff; --wait: #ff9f0a; --bad: #ff3b30; --ok: #34c759;
+    --field: #ffffff; --bar: rgba(246,246,248,0.82); --code: rgba(0,0,0,0.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #000000; --side: #1c1c1e; --ink: #f5f5f7; --dim: #8e8e93; --line: #2c2c2e;
+      --me: #0a84ff; --me-ink: #ffffff; --them: #26252a; --them-ink: #f5f5f7;
+      --sel: #0a84ff; --sel-ink: #ffffff; --wait: #ff9f0a; --bad: #ff453a; --ok: #30d158;
+      --field: #1c1c1e; --bar: rgba(22,22,24,0.82); --code: rgba(255,255,255,0.08);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; -webkit-font-smoothing: antialiased; }
+  .app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+
+  /* ---- sidebar: the conversations ---- */
+  .side { background: var(--side); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .side-head { padding: 18px 16px 10px; }
+  .side-head h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+  .side-head .summary { color: var(--dim); font-size: 13px; margin-top: 2px; }
+  .side-title { display: flex; justify-content: space-between; align-items: center; }
+  .newgroup { border: 0; background: none; color: var(--sel); font-size: 20px; cursor: pointer; padding: 2px 6px; border-radius: 8px; }
+  .newgroup:hover { background: rgba(127,127,127,0.12); }
+  .sheet { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; place-items: center; z-index: 10; backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px); }
+  .sheet.show { display: grid; }
+  .sheet form { background: var(--side); border: 1px solid var(--line); color: var(--ink); border-radius: 16px; padding: 18px; width: min(380px, 92vw); box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+  .sheet h2 { margin: 0 0 4px; font-size: 18px; } .sheet p { margin: 0 0 12px; color: var(--dim); font-size: 13px; }
+  .sheet input[type=text] { width: 100%; font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--field); color: var(--ink); }
+  .sheet .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 6px; margin: 12px 0; }
+  .sheet label { display: flex; gap: 6px; align-items: center; font-size: 14px; }
+  .sheet .row2 { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+  .sheet .err { color: var(--bad); font-size: 13px; min-height: 1em; }
+  .phone { margin-top: 8px; font-size: 12px; color: var(--dim); }
+  .phone:empty { display: none; }
+  .reviewer { margin-top: 8px; display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--dim); flex-wrap: wrap; }
+  .seg { display: inline-flex; background: rgba(127,127,127,0.15); border-radius: 8px; padding: 2px; }
+  .seg button { border: 0; background: none; color: var(--ink); font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 6px; cursor: pointer; }
+  .seg button.on { background: var(--bg); box-shadow: 0 1px 2px rgba(0,0,0,0.2); font-weight: 600; }
+  .mkdirect { border: 0; background: none; color: var(--sel); font: inherit; font-size: 12.5px; cursor: pointer; padding: 0; }
+  .stale { margin-top: 8px; font-size: 12.5px; color: #fff; background: var(--wait); border-radius: 10px; padding: 7px 9px; }
+  .stale:empty { display: none; }
+  .phone b { font: 600 13px ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 2px; color: var(--ink); }
+  .phone a { color: var(--sel); word-break: break-all; }
+  .phone .qr { display: block; width: 180px; height: 180px; margin-top: 8px; border-radius: 8px; }
+  .convs { overflow-y: auto; padding: 4px 8px 16px; }
+  .conv { display: grid; grid-template-columns: 44px 1fr auto; gap: 10px; align-items: center; width: 100%; padding: 9px 10px; border: 0;
+    border-radius: 10px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; position: relative; }
+  .conv:hover { background: rgba(127,127,127,0.10); }
+  .conv.on { background: var(--sel); color: var(--sel-ink); }
+  .conv .name { font-weight: 600; font-size: 15px; }
+  .conv .preview { color: var(--dim); font-size: 13px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .conv.on .preview, .conv.on .time { color: rgba(255,255,255,0.85); }
+  .conv .right { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; align-self: start; padding-top: 2px; }
+  .conv .time { color: var(--dim); font-size: 12px; white-space: nowrap; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--sel); }
+  .key { font: 600 10.5px/1 -apple-system, sans-serif; color: var(--dim); border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; }
+  .conv.on .key { color: rgba(255,255,255,0.85); border-color: rgba(255,255,255,0.4); }
+  .conv.on .dot { background: #fff; }
+  .pill { border-radius: 999px; padding: 1px 7px; font-size: 11.5px; font-weight: 700; color: #fff; }
+  .pill.wait { background: var(--wait); } .pill.bad { background: var(--bad); }
+
+  .avatar { width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center; font-weight: 600; font-size: 15px; color: #fff; flex: none; }
+  .avatar.sm { width: 28px; height: 28px; font-size: 10px; letter-spacing: -0.3px; }
+  .avatars { display: flex; justify-content: center; }
+  .avatars { gap: 2px; }
+  .avatars .avatar { border: 2px solid var(--bar); }
+
+  /* ---- the chat ---- */
+  .chat { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .chat-head { position: relative; z-index: 2; padding: 10px 16px 8px; text-align: center; background: var(--bar); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); border-bottom: 1px solid var(--line); }
+  .chat-head .title { font-weight: 600; font-size: 14px; margin-top: 4px; }
+  .chat-head .sub { color: var(--dim); font-size: 12px; }
+  .chat-head .sub.bad { color: var(--bad); }
+  .toast { position: absolute; left: 50%; top: calc(100% + 8px); transform: translateX(-50%); background: var(--bar); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--line); border-radius: 999px; padding: 6px 14px; font-size: 13px; white-space: nowrap; max-width: 90%; overflow: hidden; text-overflow: ellipsis;
+    opacity: 0; transition: opacity .25s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px 18px 18px; }
+  .stamp { text-align: center; color: var(--dim); font-size: 11.5px; margin: 18px 0 8px; }
+  .stamp b { font-weight: 600; }
+  .divider { display: flex; align-items: center; gap: 10px; color: var(--sel); font-size: 12px; font-weight: 600; margin: 16px 0 8px; }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: color-mix(in srgb, var(--sel) 40%, transparent); }
+  .sys { text-align: center; color: var(--dim); font-size: 12px; margin: 12px 0; }
+
+  .msg { display: flex; align-items: flex-end; gap: 8px; margin-top: 2px; }
+  .msg.first { margin-top: 10px; }
+  .msg.me { justify-content: flex-end; }
+  .msg .gutter { width: 28px; flex: none; position: relative; z-index: 1; } /* above the tail's cut-out */
+  .col { display: flex; flex-direction: column; max-width: min(72%, 640px); min-width: 0; }
+  .msg.me .col { align-items: flex-end; }
+  .sender { font-size: 11.5px; color: var(--dim); margin: 0 0 2px 12px; }
+  .sender .kind { opacity: .85; }
+  .bubble { position: relative; padding: 7px 12px; border-radius: 18px; background: var(--them); color: var(--them-ink); overflow-wrap: anywhere; scroll-margin: 90px 0; }
+  .me .bubble { background: var(--me); color: var(--me-ink); }
+  /* the tail, on the last bubble of a group */
+  .msg.last .bubble::before, .msg.last .bubble::after { content: ""; position: absolute; bottom: 0; height: 18px; z-index: 0; }
+  .msg.last:not(.me) .bubble::before { left: -7px; width: 20px; background: var(--them); border-bottom-right-radius: 16px 14px; }
+  .msg.last:not(.me) .bubble::after { left: -26px; width: 26px; background: var(--bg); border-bottom-right-radius: 10px; }
+  .msg.last.me .bubble::before { right: -7px; width: 20px; background: var(--me); border-bottom-left-radius: 16px 14px; }
+  .msg.last.me .bubble::after { right: -26px; width: 26px; background: var(--bg); border-bottom-left-radius: 10px; }
+  .bubble.waiting { box-shadow: 0 0 0 2px var(--wait); }
+  .bubble.declined { opacity: .55; }
+  .bubble.focus { box-shadow: 0 0 0 3px var(--sel); }
+  .bubble p { margin: 2px 0; } .bubble h3 { font-size: 15px; margin: 6px 0 2px; }
+  .bubble ul, .bubble ol { margin: 3px 0; padding-left: 20px; }
+  .bubble pre { background: var(--code); padding: 7px 9px; border-radius: 10px; overflow-x: auto; font-size: 12.5px; margin: 5px 0; }
+  .bubble code { background: var(--code); padding: 0 4px; border-radius: 4px; font-size: 13px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .bubble pre code { background: none; padding: 0; }
+  .bubble a { color: inherit; }
+  .more { border: 0; background: none; color: inherit; opacity: .8; text-decoration: underline; cursor: pointer; padding: 3px 0 0; font: inherit; font-size: 13px; }
+  .receipt { font-size: 11px; color: var(--dim); margin: 3px 6px 0; font-weight: 500; }
+  .receipt.bad { color: var(--bad); } .receipt.wait { color: var(--wait); }
+  .approval { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 4px 0; align-items: center; }
+  .approval .label { font-size: 12px; color: var(--wait); font-weight: 600; margin-right: 4px; }
+  .chip { border: 1px solid var(--line); background: var(--field); color: var(--ink); border-radius: 999px; padding: 4px 12px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
+  .chip.go { background: var(--ok); border-color: var(--ok); color: #fff; }
+  .chip.no { color: var(--bad); }
+  .declinebox { display: flex; gap: 6px; margin: 6px 4px 0; width: min(520px, 100%); }
+  .declinebox textarea { flex: 1; }
+
+  /* ---- the composer ---- */
+  .composer { display: flex; align-items: flex-end; gap: 8px; padding: 8px 14px 12px; border-top: 1px solid var(--line); background: var(--bar); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); }
+  .composer select { border: 1px solid var(--line); background: var(--field); color: var(--ink); border-radius: 999px; padding: 6px 10px; font: inherit; font-size: 13px; }
+  .field { flex: 1; display: flex; align-items: flex-end; border: 1px solid var(--line); background: var(--field); border-radius: 18px; padding: 4px 4px 4px 12px; }
+  textarea { font: inherit; color: var(--ink); background: transparent; border: 0; outline: none; resize: none; min-height: 26px; max-height: 160px; padding: 4px 0; width: 100%; }
+  .declinebox textarea { border: 1px solid var(--line); background: var(--field); border-radius: 14px; padding: 6px 10px; resize: vertical; }
+  .send { width: 30px; height: 30px; border-radius: 50%; border: 0; background: var(--me); color: #fff; font-size: 17px; font-weight: 700; cursor: pointer; display: grid; place-items: center; flex: none; }
+  .send:disabled { background: var(--line); cursor: default; }
+  .jump { position: absolute; right: 18px; bottom: 74px; border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; background: var(--bar); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); color: var(--ink); cursor: pointer; font: inherit; font-size: 12.5px; display: none; }
+  .chat { position: relative; }
+  .empty { color: var(--dim); text-align: center; margin-top: 30vh; }
+
+  @media (max-width: 760px) {
+    .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    .side { border-right: 0; border-bottom: 1px solid var(--line); }
+    .side-head { padding: 10px 14px 4px; } .side-head h1 { font-size: 18px; }
+    .convs { display: flex; gap: 4px; overflow-x: auto; padding: 4px 8px 8px; }
+    .conv { display: block; width: auto; flex: none; padding: 6px; }
+    .conv .name, .conv .preview, .conv .time, .conv .key { display: none; }
+    .conv .right { position: absolute; top: 2px; right: 0; flex-direction: row; gap: 3px; padding: 0; }
+    .conv .dot { border: 2px solid var(--side); width: 12px; height: 12px; }
+    .col { max-width: 85%; }
+    .composer { flex-wrap: wrap; }
+    .composer .field { flex-basis: 100%; order: 3; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="side-head"><div class="side-title"><h1>Agent Comms</h1><button class="newgroup" id="newgroup" title="New group">✎</button></div><div class="summary" id="summary">Loading…</div><div class="reviewer" id="reviewer"></div><div class="phone" id="phone"></div><div class="stale" id="stale"></div></div>
+    <nav class="convs" id="convs"></nav>
+  </aside>
+  <section class="chat">
+    <div class="chat-head" id="head"><div class="toast" id="toast"></div></div>
+    <div class="scroll" id="scroll"><div class="empty">Loading…</div></div>
+    <button class="jump" id="jump">↓ Latest</button>
+    <div class="composer">
+      <select id="to" title="To"></select>
+      <select id="kind" title="Kind">
+        <option value="note">note</option><option value="question">question</option><option value="answer">answer</option>
+        <option value="ruling">ruling</option><option value="report">report</option><option value="blocked">blocked</option>
+      </select>
+      <div class="field">
+        <textarea id="text" rows="1" placeholder="Message"></textarea>
+        <button class="send" id="send" title="Send (Return)" disabled>↑</button>
+      </div>
+    </div>
+  </section>
+</div>
+<div class="sheet" id="sheet"><form id="groupform">
+  <h2>New group</h2><p>The reviewer is always in it. Messages to Everyone reach all members.</p>
+  <input type="text" id="gname" placeholder="Group name, e.g. team-a" autocomplete="off" spellcheck="false">
+  <div class="agents" id="gagents"></div>
+  <div class="err" id="gerr"></div>
+  <div class="row2"><button type="button" class="chip" id="gcancel">Cancel</button><button type="submit" class="chip go">Create</button></div>
+</form></div>
+<script>
+(() => {
+  const token = new URLSearchParams(location.search).get('t') || ''
+  const $ = id => document.getElementById(id)
+  const PREVIEW = 1500
+  const PAGE_VERSION = '2026-10-12.1' // the server this page was written with; a different one asks for a restart
+  const GROUP_MS = 5 * 60 * 1000, STAMP_MS = 60 * 60 * 1000
+  let data = null, lastJson = '', chosen = '', focusId = '', declining = '', dividerBefore = ''
+  const expanded = new Set()
+
+  // the Mac's page carries the key in its link; a paired phone carries it as a cookie instead
+  const api = (path, body) => {
+    const headers = token ? { 'X-Comms-Token': token } : {}
+    if (body) headers['Content-Type'] = 'application/json'
+    return fetch(path, { method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' })
+      .then(r => { if (r.status === 403 && !token) location.replace('/phone'); return r.json() })
+  }
+
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+  const isReviewer = id => /^reviewer/i.test(id)
+  const isMe = id => id === 'maintainer'
+
+  // ---- names, colours, avatars
+  const hue = id => { let h = 0; for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360; return h }
+  const avatarBg = id => isMe(id) ? '#0a84ff' : isReviewer(id) ? 'linear-gradient(135deg,#bf5af2,#8944ab)' : `linear-gradient(135deg,hsl(${hue(id)},55%,58%),hsl(${(hue(id) + 30) % 360},55%,42%))`
+  const initials = id => isReviewer(id) ? 'R' + (id.slice(8, 9) || '') : isMe(id) ? 'Me' : /^\d+$/.test(id) ? id.slice(0, 3) : id.split(/[-_]/).map(w => w[0] || '').join('').slice(0, 2).toUpperCase()
+  const avatar = (id, sm) => `<div class="avatar ${sm ? 'sm' : ''}" style="background:${avatarBg(id)}" title="${esc(id)}">${esc(initials(id))}</div>`
+
+  // ---- times, as Messages writes them
+  const day = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  const clock = d => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  const dayName = d => {
+    const diff = Math.round((day(new Date()) - day(d)) / 86400000)
+    if (diff === 0) return 'Today'
+    if (diff === 1) return 'Yesterday'
+    if (diff < 7) return d.toLocaleDateString([], { weekday: 'long' })
+    return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })
+  }
+  const listTime = ts => { const d = new Date(ts); const diff = Math.round((day(new Date()) - day(d)) / 86400000); return diff === 0 ? clock(d) : diff === 1 ? 'Yesterday' : diff < 7 ? d.toLocaleDateString([], { weekday: 'long' }) : d.toLocaleDateString() }
+
+  // ---- a small, safe markdown: everything escaped first; only these marks become tags
+  const inline = t => esc(t)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+  const markdown = src => {
+    const out = []; let list = null, para = []
+    const endPara = () => { if (para.length) { out.push('<p>' + para.map(inline).join('<br>') + '</p>'); para = [] } }
+    const endList = () => { if (list) { out.push('</' + list + '>'); list = null } }
+    const lines = src.replace(/\r\n?/g, '\n').split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (/^```/.test(line)) {
+        endPara(); endList(); const code = []
+        for (i++; i < lines.length && !/^```/.test(lines[i]); i++) code.push(lines[i])
+        out.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>'); continue
+      }
+      const h = /^(#{1,3})\s+(.*)$/.exec(line)
+      if (h) { endPara(); endList(); out.push('<h3>' + inline(h[2]) + '</h3>'); continue }
+      const li = /^\s*(?:[-*•]|(\d+)[.)])\s+(.*)$/.exec(line)
+      if (li) {
+        endPara(); const kind = li[1] ? 'ol' : 'ul'
+        if (list !== kind) { endList(); out.push('<' + kind + '>'); list = kind }
+        out.push('<li>' + inline(li[2]) + '</li>'); continue
+      }
+      if (!line.trim()) { endPara(); endList(); continue }
+      endList(); para.push(line)
+    }
+    endPara(); endList()
+    return out.join('')
+  }
+
+  // the pairing QR as an SVG (dark on white, with its quiet zone)
+  const qrSvg = rows => {
+    if (!rows || !rows.length) return ''
+    const n = rows.length, q = 2, size = n + 2 * q
+    let path = ''
+    rows.forEach((row, y) => { for (let x = 0; x < n; x++) if (row[x] === '1') path += `M${x + q} ${y + q}h1v1h-1z` })
+    return `<svg class="qr" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges" role="img" aria-label="pairing QR code"><rect width="${size}" height="${size}" fill="#fff"/><path d="${path}" fill="#000"/></svg>`
+  }
+
+  // ---- the sidebar
+  const preview = thread => {
+    const last = [...thread].reverse().find(m => !m.setup)
+    if (!last) return { text: 'No messages yet', ts: '' }
+    const who = isMe(last.from) ? 'You' : last.from
+    const line = last.body.replace(/[`*#>]/g, '').split('\n').find(l => l.trim()) || ''
+    return { text: `${who}: ${line}`, ts: last.ts }
+  }
+  const renderSide = () => {
+    const channels = data.channels
+    const pending = channels.reduce((n, c) => n + c.pending, 0), unread = channels.reduce((n, c) => n + c.unread, 0)
+    $('summary').textContent = [pending ? `${pending} to approve` : '', unread ? `${unread} unread` : ''].filter(Boolean).join(' · ') || 'All caught up'
+    const mode = data.reviewer_mode || 'code'
+    $('reviewer').innerHTML = `Reviewer is a <span class="seg"><button data-mode="code" class="${mode === 'code' ? 'on' : ''}" title="A Claude Code session runs /comms-as reviewer and is woken by every message sent to it">Code session</button><button data-mode="chat" class="${mode === 'chat' ? 'on' : ''}" title="A Chat agent reads the folder on its own schedule">Chat agent</button></span>` +
+      (data.has_direct === false ? ' <button class="mkdirect" data-direct="1">+ Private chat with the reviewer</button>' : '')
+    $('stale').textContent = data.server_version === PAGE_VERSION ? '' :
+      'Agent Comms was updated. Close its Terminal window and double-click the launcher again to finish (a phone pairs again after that).'
+    const ph = data.phone
+    $('phone').innerHTML = ph ? (ph.locked ? '📱 Phone pairing locked: restart Agent Comms to pair again.'
+      : `📱 Scan with your phone's camera, or open <a href="${esc(ph.url)}">${esc(ph.url)}</a> and type <b>${esc(ph.code)}</b>${qrSvg(ph.qr)}`) : ''
+    $('convs').innerHTML = channels.map((c, i) => {
+      const p = preview(data.threads[c.id] || [])
+      const badges = (c.pending ? `<span class="pill wait" title="waiting for your approval">${c.pending}</span>` : '') +
+        (c.skipped ? `<span class="pill bad" title="unreadable files">!</span>` : '') +
+        (c.unread ? '<span class="dot" title="unread"></span>' : '')
+      const key = i < 9 ? `⌃${i + 1}` : ''
+      return `<button class="conv ${c.id === chosen ? 'on' : ''}" data-tab="${esc(c.id)}" title="${key ? 'Ctrl+' + (i + 1) + ' (or Cmd/Option+' + (i + 1) + ')' : ''}">${avatar(c.group ? c.id : (c.agents[0] || 'reviewer'))}` +
+        `<div><div class="name">${esc(c.group ? '#' + c.id : c.agents.length ? c.agents.join(' & ') : 'Reviewer (private)')}</div><div class="preview">${esc(p.text)}</div></div>` +
+        `<div class="right"><span class="time">${p.ts ? esc(listTime(p.ts)) : ''}</span>${badges}${key ? `<kbd class="key">${key}</kbd>` : ''}</div></button>`
+    }).join('')
+  }
+
+  // ---- the chat
+  const receiptOf = m => {
+    if (m.declined !== null && m.declined !== undefined) return `<div class="receipt bad">Not Delivered${m.declined ? ' · ' + esc(m.declined) : ''}</div>`
+    if (m.pending) return ''
+    if (m.needs_approval && m.approved) return '<div class="receipt">Delivered</div>'
+    return ''
+  }
+  const approvalOf = m => {
+    if (!m.pending) return ''
+    if (declining === m.id) {
+      return `<div class="declinebox"><textarea id="reason" rows="2" placeholder="Why decline? Sent to ${esc(m.from)} and ${esc(m.to)}."></textarea>` +
+        `<button class="chip no" data-decline-send="${esc(m.id)}">Decline</button><button class="chip" data-decline-cancel="1">Cancel</button></div>`
+    }
+    return `<div class="approval"><span class="label">${m.held ? '⏸ On Hold' : '⏳ Needs your approval'}</span>` +
+      `<button class="chip go" data-approve="${esc(m.id)}">Approve</button>` +
+      (m.held ? '' : `<button class="chip" data-hold="${esc(m.id)}">Hold</button>`) +
+      `<button class="chip no" data-decline="${esc(m.id)}">Decline</button></div>`
+  }
+  const renderChat = () => {
+    const ch = data.channels.find(c => c.id === chosen)
+    const thread = data.threads[chosen] || []
+    if (!ch) { $('scroll').innerHTML = '<div class="empty">No channels yet. Run /comms-setup in Claude Code.</div>'; return }
+    const people = [...ch.agents, ...ch.reviewers]
+    const who = (data.reviewer_mode || 'code') === 'chat' ? 'reviewer: Chat agent, reads on its schedule' : 'reviewer: Code session, woken by messages'
+    const sub = ch.skipped ? `<div class="sub bad">⚠ ${ch.skipped} unreadable file${ch.skipped === 1 ? '' : 's'}</div>` : `<div class="sub">#${esc(ch.id)} · ${ch.pending ? ch.pending + ' waiting for approval · ' : ''}${who}</div>`
+    $('head').innerHTML = `<div class="avatars">${people.map(p => avatar(p, true)).join('')}</div><div class="title">${esc(ch.group ? '#' + ch.id + ' · ' + people.join(', ') : people.join(' & '))}</div>${sub}<div class="toast" id="toast"></div>`
+    let html = '', prev = null
+    for (let i = 0; i < thread.length; i++) {
+      const m = thread[i], next = thread[i + 1]
+      if (m.setup) { html += `<div class="sys">${ch.group ? 'Group' : 'Channel'} set up · the format guide was sent to ${m.to === 'all' ? 'everyone' : esc(m.to)}</div>`; prev = null; continue }
+      const t = Date.parse(m.ts)
+      if (!prev || t - Date.parse(prev.ts) > STAMP_MS) html += `<div class="stamp"><b>${esc(dayName(new Date(t)))}</b> ${esc(clock(new Date(t)))}</div>`
+      if (m.id === dividerBefore) html += '<div class="divider">New Messages</div>'
+      const first = !prev || prev.from !== m.from || t - Date.parse(prev.ts) > GROUP_MS || m.id === dividerBefore
+      const last = !next || next.setup || next.from !== m.from || Date.parse(next.ts) - t > GROUP_MS || next.id === dividerBefore
+      const me = isMe(m.from)
+      const long = m.body.length > PREVIEW && !expanded.has(m.id)
+      const body = long ? m.body.slice(0, PREVIEW).replace(/\n[^\n]*$/, '') + '\n\n…' : m.body
+      const cls = ['bubble', m.pending ? 'waiting' : '', m.declined !== null && m.declined !== undefined ? 'declined' : '', m.id === focusId ? 'focus' : ''].join(' ')
+      html += `<div class="msg ${me ? 'me' : ''} ${first ? 'first' : ''} ${last ? 'last' : ''}">`
+      if (!me) html += `<div class="gutter">${last ? avatar(m.from, true) : ''}</div>`
+      html += '<div class="col">'
+      if (first) html += `<div class="sender">${me ? '' : esc(m.from) + ' '}<span class="kind">→ ${m.to === 'all' ? 'everyone' : esc(m.to)} · ${esc(m.kind)}</span></div>`
+      html += `<div class="${cls}" id="m-${esc(m.id)}" title="${esc(new Date(t).toLocaleString())}">${markdown(body)}`
+      if (m.body.length > PREVIEW) html += `<button class="more" data-more="${esc(m.id)}">${expanded.has(m.id) ? 'Show less' : 'Show full message (' + m.body.length.toLocaleString('en') + ' characters)'}</button>`
+      html += '</div>' + receiptOf(m) + approvalOf(m) + '</div></div>'
+      prev = m
+    }
+    $('scroll').innerHTML = html || '<div class="empty">No messages yet.</div>'
+    const to = $('to'), keep = to.value
+    const targets = ch.group ? ['all', ...people] : people
+    to.innerHTML = targets.map(p => `<option value="${esc(p)}">To: ${p === 'all' ? 'Everyone' : esc(p)}</option>`).join('')
+    // keep the pick while in the same conversation; a new one starts on its first choice (Everyone in a group)
+    if (to.dataset.channel === ch.id && targets.includes(keep)) to.value = keep
+    to.dataset.channel = ch.id
+  }
+
+  const box = () => $('scroll')
+  const atBottom = () => box().scrollHeight - box().scrollTop - box().clientHeight < 60
+  const toBottom = () => { box().scrollTop = box().scrollHeight }
+  const updateJump = () => { $('jump').style.display = atBottom() ? 'none' : 'block' }
+
+  const render = keepBottom => {
+    if (!data) return
+    if (!data.ok) { $('scroll').innerHTML = `<div class="empty">${esc(data.error || 'error')}</div>`; return }
+    if (!chosen || !data.channels.some(c => c.id === chosen)) chosen = data.channels[0] ? data.channels[0].id : ''
+    const top = box().scrollTop
+    renderSide(); renderChat()
+    if (keepBottom) toBottom(); else box().scrollTop = top
+    updateJump()
+  }
+
+  let toastTimer = 0
+  const toast = text => {
+    const t = $('toast'); if (!t || !text) return
+    t.textContent = text; t.classList.add('show')
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 4000)
+  }
+
+  const refresh = async force => {
+    if (!force && declining) return // never redraw under a reason being typed
+    try {
+      const next = await api('/api/state')
+      const json = JSON.stringify(next)
+      if (!force && json === lastJson) return
+      const wasBottom = atBottom()
+      lastJson = json; data = next
+      render(wasBottom)
+    } catch (e) { $('summary').textContent = 'Not connected: is the Terminal window still open?' }
+  }
+
+  const act = async (path, body) => {
+    const r = await api(path, { channel: chosen, ...body })
+    await refresh(true)
+    toast(r.info || r.error || '')
+  }
+
+  const openConv = async id => {
+    chosen = id; declining = ''
+    const thread = (data && data.threads[id]) || []
+    const fresh = thread.find(m => m.fresh && !m.setup)
+    const target = fresh || thread.find(m => m.pending)
+    focusId = target ? target.id : ''
+    dividerBefore = fresh ? fresh.id : ''
+    render(!target)
+    const show = () => { const el = target && document.getElementById('m-' + target.id); if (el) el.scrollIntoView({ block: 'center' }) }
+    show()
+    await api('/api/seen', { channel: id })
+    await refresh(true)
+    show()
+  }
+
+  document.addEventListener('click', e => {
+    const t = e.target.closest('button'); if (!t) return
+    const d = t.dataset
+    if (d.tab) return void openConv(d.tab)
+    if (d.mode) return void act('/api/settings', { reviewer_mode: d.mode })
+    if (d.direct) return void act('/api/direct', {}).then(() => openConv('direct'))
+    if (d.approve) return void act('/api/approve', { id: d.approve })
+    if (d.hold) return void act('/api/hold', { id: d.hold })
+    if (d.decline) { declining = d.decline; render(false); const r = $('reason'); if (r) { r.scrollIntoView({ block: 'center' }); r.focus({ preventScroll: true }) } return }
+    if (d.declineCancel) { declining = ''; render(false); return }
+    if (d.declineSend) { const reason = ($('reason') || {}).value || ''; declining = ''; return void act('/api/decline', { id: d.declineSend, reason }) }
+    if (d.more) { expanded.has(d.more) ? expanded.delete(d.more) : expanded.add(d.more); render(false) }
+  })
+
+  document.addEventListener('keydown', e => {
+    const digit = /^Digit([1-9])$/.exec(e.code)  // e.code: Option+1 types ¡, but the key is still Digit1
+    if (digit && (e.metaKey || e.ctrlKey || e.altKey) && !e.shiftKey && data && data.ok) {
+      const c = data.channels[Number(digit[1]) - 1]
+      if (c) { e.preventDefault(); openConv(c.id) }
+      return
+    }
+    if (e.key === 'Escape' && declining) { declining = ''; render(false) }
+  })
+
+  const openSheet = () => {
+    const agents = (data && data.agents) || [...new Set(((data && data.channels) || []).flatMap(c => c.agents || []))]
+    $('gagents').innerHTML = agents.map(a => `<label><input type="checkbox" value="${esc(a)}"> ${esc(a)}</label>`).join('') || '<span class="err">No agents yet.</span>'
+    $('gname').value = ''; $('gerr').textContent = ''
+    $('sheet').classList.add('show'); $('gname').focus()
+  }
+  const closeSheet = () => $('sheet').classList.remove('show')
+  $('newgroup').addEventListener('click', openSheet)
+  $('gcancel').addEventListener('click', closeSheet)
+  $('sheet').addEventListener('click', e => { if (e.target === $('sheet')) closeSheet() })
+  $('groupform').addEventListener('submit', async e => {
+    e.preventDefault()
+    const name = $('gname').value.trim()
+    const agents = [...$('gagents').querySelectorAll('input:checked')].map(i => i.value)
+    const r = await api('/api/group', { name, agents })
+    if (r.ok && /is ready/.test(r.info || '')) { closeSheet(); await refresh(true); openConv(name); toast(r.info) }
+    else $('gerr').textContent = r.error === 'not found' ? 'Restart Agent Comms first: close its Terminal window and double-click the launcher again.' : (r.info || r.error || 'That did not work.')
+  })
+
+  const text = $('text')
+  const grow = () => { text.style.height = 'auto'; text.style.height = Math.min(160, text.scrollHeight) + 'px'; $('send').disabled = !text.value.trim() }
+  const send = async () => {
+    if (!text.value.trim()) return
+    await act('/api/post', { to: $('to').value, kind: $('kind').value, text: text.value })
+    text.value = ''; grow(); toBottom()
+  }
+  text.addEventListener('input', grow)
+  text.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send() } })
+  $('send').addEventListener('click', send)
+  $('jump').addEventListener('click', () => box().scrollTo({ top: box().scrollHeight, behavior: 'smooth' }))
+  box().addEventListener('scroll', updateJump, { passive: true })
+
+  refresh(true).then(toBottom)
+  setInterval(() => refresh(false), 3000)
+  setInterval(() => { if (data && !declining && !text.matches(':focus')) render(atBottom()) }, 60000) // keep the times fresh
+})()
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.pyc
+# written by Claude Code (/plugin-types or a mod load); generate them locally
+plugin/.claude/
+plugin/.claude-plugin/types/

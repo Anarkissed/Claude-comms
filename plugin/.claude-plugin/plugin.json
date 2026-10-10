@@ -1,0 +1,9 @@
+{
+  "name": "agent-comms",
+  "version": "0.1.0",
+  "description": "Per-agent message channels with the reviewer, kept as JSON files in a local folder; reviewer messages reach an agent only after the maintainer approves them.",
+  "author": {
+    "name": "Anarkissed"
+  },
+  "types": "./types/index.d.ts"
+}
