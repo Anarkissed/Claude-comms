@@ -12,7 +12,7 @@ const DEFAULT_CONFIG = {
   channels: ['358', '354', '361', '362'].map(id => ({ id, members: ['reviewer', id] })),
 }
 const WIN_ROOT = 'C:/Users/me/agent-comms'
-const HOME = '/w/home'
+const HOME = '/w' // so the default folder, HOME/agent-comms, is ROOT
 const ROOT = '/w/agent-comms'
 const CWD = '/w/proj'
 const SID = 'S1'
@@ -91,11 +91,8 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
   if (options.config !== null) put(`${root}/channels.json`, JSON.stringify(options.config ?? DEFAULT_CONFIG))
   w.clock = mock.clock(on, { now: T0 })
   mock.store(on, { ...(options.identity ? { [`identity:${SID}`]: options.identity } : {}), ...(options.store ?? {}) })
-  // AGENT_COMMS_TEST_DELIVERY_SINK: this kit cannot answer session.append, so the mod logs each delivered row (see appendRow)
-  mock.env(on, options.windows
-    // Windows: no HOME, no AGENT_COMMS_ROOT (so the default C:/Users/me/agent-comms is what is tested)
-    ? { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\me', AGENT_COMMS_TEST_DELIVERY_SINK: '1' }
-    : { HOME, AGENT_COMMS_ROOT: ROOT, AGENT_COMMS_TEST_DELIVERY_SINK: '1' })
+  // the plugin reads only the home folder: USERPROFILE on Windows, HOME elsewhere
+  mock.env(on, options.windows ? { USERPROFILE: 'C:\\Users\\me' } : { HOME })
 
   const listDir = (path: string): FsEntry[] => {
     const p = real(path)
@@ -210,11 +207,16 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     return { value: undefined }
   })
   on('ui.log', ($, e) => {
-    if (e.text.startsWith('deliver: ')) w.appended.push(e.text.slice('deliver: '.length))
-    else w.logs.push(e.text)
+    w.logs.push(e.text)
     return { value: undefined }
   })
   on('ui.open', () => ({ value: { isPlaced: true } }))
+  // each delivered message, as the conversation would keep it
+  on('session.append', ($, e, next) => {
+    const block = e.message.content[0]
+    if (block !== undefined && typeof block === 'object' && 'text' in block) w.appended.push(String(block.text))
+    return next(e)
+  })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => {
     w.tools.push(e.name)
@@ -301,24 +303,30 @@ describe('1. format and parse', () => {
 // ---- 2. atomic write ------------------------------------------------------
 
 describe('2. atomic write', () => {
-  test('a message reaches its name only by rename; no partial file is ever listed', async ($, on) => {
+  test('a message is written straight to its name with the file API; the plugin runs no program', async ($, on) => {
     const w = world(on, { identity: '358' })
     await start($)
     const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'report', text: 'build is green' })
     expect(denial(posted)).toBeUndefined()
     const finals = [...w.files.keys()].filter(p => p.startsWith(msgDir('358')))
     expect(finals).toHaveLength(1)
-    const final = finals[0] ?? ''
-    // every $.fs.write went to a dot-named temp file, never to the final name
     const messageWrites = w.writes.filter(p => p.startsWith(msgDir('358')))
-    expect(messageWrites).toHaveLength(1)
-    expect(nameOf(messageWrites[0] ?? '')).toMatch(/^\..*\.tmp$/)
-    expect(messageWrites).not.toContain(final)
-    // at the moment the temp held the text, a reader listing the folder saw no candidate that fails to parse
-    for (const snap of w.listedAtWrite) expect(snap.allParse).toBe(true)
-    expect(w.ran.some(a => a[0] === '/bin/mv' && a[1] === '-n' && a[3] === final)).toBe(true)
-    // the temp is gone
-    expect([...w.files.keys()].some(p => nameOf(p).endsWith('.tmp'))).toBe(false)
+    expect(messageWrites).toEqual(finals)
+    expect(parse(w.files.get(finals[0] ?? '') ?? '', nameOf(finals[0] ?? '').slice(0, -5))).toMatchObject({ ok: true })
+    expect(w.ran).toEqual([])
+  })
+
+  test('a message caught mid-write is read again once complete, and delivered', async ($, on) => {
+    const w = world(on, { identity: '358' })
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'finished writing', nowMs: T0 - 1000, hex: 'half01' })
+    const text = format(m)
+    put(w, `${msgDir('358')}/${m.id}.json`, text.slice(0, 20))
+    await start($)
+    await turn($, 1)
+    expect(w.appended).toEqual([])
+    put(w, `${msgDir('358')}/${m.id}.json`, text)
+    await turn($, 2)
+    expect(w.appended.some(t => t.includes('finished writing'))).toBe(true)
   })
 
   test('a half-written temp file is neither listed nor counted as skipped', async ($, on) => {
@@ -444,6 +452,26 @@ describe('5. tool.call guard', () => {
       await $.tool.call({ tool: 'Read', file_path: `${msgDir('358')}/${m.id}.json` }),
     ]
     for (const r of allowed) expect(denial(r)).toBeUndefined()
+  })
+
+  test('the Comms folder setting places the folder; HOME/agent-comms is only the default', { options: { folder: '/w/elsewhere' } }, async ($, on) => {
+    const w = world(on, { identity: '358' })
+    put(w, '/w/elsewhere/channels.json', JSON.stringify(DEFAULT_CONFIG))
+    await start($)
+    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'note', text: 'moved' })
+    expect(denial(posted)).toBeUndefined()
+    expect([...w.files.keys()].some(p => p.startsWith('/w/elsewhere/channels/358/messages/'))).toBe(true)
+    expect([...w.files.keys()].some(p => p.startsWith(`${msgDir('358')}/`))).toBe(false)
+  })
+
+  test('a command typed as agent-comms:<name> is answered the same as the plain name', async ($, on) => {
+    world(on)
+    const plain = await $.command.run({ command: 'comms-as', args: '', ...PERSON })
+    const spaced = await $.command.run({ command: 'agent-comms:comms-as', args: '', ...PERSON })
+    expect(plain.text).toContain('not joined')
+    expect(spaced.text).toBe(plain.text)
+    const joined = await $.command.run({ command: 'agent-comms:comms-as', args: '358', ...PERSON })
+    expect(joined.text).toContain('this session is 358')
   })
 
   test('the model cannot run the person-only commands through the Skill tool', async ($, on) => {
@@ -1287,15 +1315,14 @@ describe('Windows (the plugin on a PC)', () => {
   const winMsg = (ch: string) => `${WIN_ROOT}/channels/${ch}/messages`
   const winAppr = (ch: string) => `${WIN_ROOT}/channels/${ch}/approvals`
 
-  test('the default folder is %USERPROFILE%\\agent-comms; messages move with PowerShell, never /bin/mv', async ($, on) => {
+  test('the default folder is %USERPROFILE%\\agent-comms; messages are written there with no program run', async ($, on) => {
     const w = world(on, { identity: '358', windows: true })
     await start($)
     const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'report', text: 'built on Windows' })
     expect(denial(posted)).toBeUndefined()
     const [path] = [...w.files.keys()].filter(p => p.startsWith(`${winMsg('358')}/`))
     expect(parse(w.files.get(path ?? '') ?? '', nameOf(path ?? '').slice(0, -5))).toMatchObject({ ok: true })
-    expect(w.ran.some(a => a[0] === 'powershell.exe' && (a.at(-1) ?? '').startsWith('Move-Item -LiteralPath $env:AGENT_COMMS_FROM '))).toBe(true)
-    expect(w.ran.some(a => (a[0] ?? '').startsWith('/bin/'))).toBe(false)
+    expect(w.ran).toEqual([])
     expect([...w.files.keys()].some(p => p.endsWith('.tmp'))).toBe(false)
   })
 

@@ -14,5 +14,13 @@
   "supportUrl": "https://github.com/Anarkissed/Claude-comms/issues",
   "license": "MIT",
   "icon": "./icon.svg",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "folder": {
+      "type": "directory",
+      "title": "Comms folder",
+      "description": "Where the channels and messages are kept. Leave empty for agent-comms in your home folder. Must not be inside a git repository.",
+      "default": ""
+    }
+  }
 }

@@ -50,7 +50,7 @@ You need Claude Code (terminal, desktop app or IDE) and, for the web desk, Pytho
    `CLAUDE_CODE_PLUGIN_DIR_WATCH=1` makes desktop-app sessions pick up plugin updates without a restart. Restart your sessions once.
 
    **On Windows** the file is `%USERPROFILE%\.claude\settings.json`. Write the path with forward slashes, e.g. `"CLAUDE_CODE_PLUGIN_DIRS": "C:/Users/you/claude-comms/plugin"`. The comms folder defaults to `%USERPROFILE%\agent-comms`.
-3. In any session, run `/comms-setup`. It shows the folder (`~/agent-comms`; set `AGENT_COMMS_ROOT` to use another, outside any git repository), asks, then creates it with `channels.json` and #direct.
+3. In any session, run `/comms-setup`. It shows the folder (`~/agent-comms`; to use another, outside any git repository, set the plugin's **Comms folder** setting in `/config`), asks, then creates it with `channels.json` and #direct.
 
 ## Use
 
@@ -80,15 +80,9 @@ Double-click `web/Agent Comms.command` (this Mac only) or `web/Agent Comms (phon
 
 ## What the plugin runs
 
-- **No network requests.**
-- **Local commands only**, all on the comms folder:
-  - **macOS / Linux:** `/bin/mv` to put each message in place in one step (no reader ever sees half a file), and `/bin/rm -f` to remove its own temporary file if that fails.
-  - **Windows:** PowerShell's `Move-Item` and `Remove-Item` for the same two jobs, with the paths passed as environment variables so the command text is fixed.
-  - The exact commands are listed in [plugin/README.md](plugin/README.md#programs-it-runs-and-why).
-  - **Everywhere:** `git rev-parse --is-inside-work-tree`, once during `/comms-setup`, so the folder isn't created inside a git repository.
-- **Folders** are created by writing an empty `.keep` file, with no command.
-- **Nothing else:** it never runs anything taken from a message, downloads nothing, and declares no MCP servers.
+- **No network requests and no programs.** Everything is done with Claude Code's file API, inside the comms folder.
 - **One check on other tools:** a hook on Claude Code's tool calls refuses any model tool call that would write to the comms folder other than through `comms_post`. It checks real paths for file tools and, as a best effort, the command text for shell commands.
+- **What it adds to conversations,** with the exact text of each, and every hook, are listed in [plugin/README.md](plugin/README.md#data-handling).
 
 ## The file format
 
@@ -129,7 +123,7 @@ For a reviewer that writes files itself, such as a Chat agent with file access:
 
 ## Development
 
-- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (69 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
+- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (72 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
 - **Web:** `cd web && python3 -m unittest -v test_web` (29 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
 
 Forks and pull requests are welcome. Released under the [MIT License](LICENSE).

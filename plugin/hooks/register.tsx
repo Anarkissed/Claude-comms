@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ProcessRunResult, Register, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
+import type { CommandRunInput, CommandRunResult, EngineInterface, Register, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
 
 import type { CommsChannelRow, CommsThreadItem } from '../types'
 import {
@@ -29,11 +29,9 @@ import {
   parse,
   parseApproval,
   parseConfig,
-  randomHex,
   setupNoteBody,
   setupNoteMarker,
   splitKind,
-  tempNameFor,
   type Channel,
   type Config,
   type Kind,
@@ -126,7 +124,8 @@ let timer: Timer | undefined
 let timerMs = 0
 let turnRunning = false
 /** Test seam (see appendRow): set from AGENT_COMMS_TEST_DELIVERY_SINK at init. */
-let testSink = false
+/** The "Comms folder" setting (userConfig `folder`); empty means agent-comms in the home folder. */
+let folderOption = ''
 /** Windows: files move with PowerShell; paths are written C:/… */
 let windows = false
 let scanning: Promise<void> | undefined
@@ -162,12 +161,12 @@ const readWoken = async ($: Engine): Promise<Set<string>> => {
 
 const init = async ($: Engine) => {
   sessionId = await $.session.id()
-  windows = (await $.env.get('OS')) === 'Windows_NT'
-  // HOME on macOS and Linux; USERPROFILE on Windows (Git Bash may set HOME there too)
-  home = toSlashes((await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '')
-  const configured = await $.env.get('AGENT_COMMS_ROOT')
-  root = absolutize(configured ?? `${home}/agent-comms`, home || '/', home)
-  testSink = (await $.env.get('AGENT_COMMS_TEST_DELIVERY_SINK')) === '1'
+  // The only environment the plugin reads: the home folder, to place the comms folder.
+  // USERPROFILE on Windows (always set there, with its drive letter), HOME elsewhere.
+  home = toSlashes((await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? '')
+  windows = /^[A-Za-z]:\//.test(home)
+  // the folder: the plugin's "Comms folder" setting (userConfig `folder`), else agent-comms in the home folder
+  root = absolutize(folderOption !== '' ? folderOption : `${home}/agent-comms`, home || '/', home)
   const stored = await $.store.get(identityKey())
   me = typeof stored === 'string' && isId(stored) ? stored : undefined
 }
@@ -196,29 +195,6 @@ const listSafe = async ($: Engine, dir: string) => {
 }
 
 /**
- * The only programs the plugin runs besides `git rev-parse` in /comms-setup.
- * Every command is a fixed literal; only the two file paths vary. On Windows the
- * paths reach PowerShell as environment variables, so its command text never changes.
- *
- * Renames `from` to `to` in one step: `/bin/mv` on macOS and Linux (rename(2)),
- * PowerShell's Move-Item on Windows (MoveFileEx). Without `replace`, an existing
- * `to` is kept (`mv -n`; Move-Item refuses without -Force).
- */
-const moveFile = async ($: Engine, from: string, to: string, replace: boolean): Promise<ProcessRunResult> => {
-  const env = { AGENT_COMMS_FROM: from, AGENT_COMMS_TO: to }
-  if (windows && replace) return $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'Move-Item -LiteralPath $env:AGENT_COMMS_FROM -Destination $env:AGENT_COMMS_TO -Force'], { env })
-  if (windows) return $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'Move-Item -LiteralPath $env:AGENT_COMMS_FROM -Destination $env:AGENT_COMMS_TO'], { env })
-  if (replace) return $.process.run(['/bin/mv', '-f', from, to])
-  return $.process.run(['/bin/mv', '-n', from, to])
-}
-
-/** Deletes the plugin's own temporary file after a failed rename. Nothing else is ever deleted. */
-const removeTemp = async ($: Engine, temp: string): Promise<ProcessRunResult> => {
-  if (windows) return $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'Remove-Item -LiteralPath $env:AGENT_COMMS_FROM -Force -ErrorAction SilentlyContinue'], { env: { AGENT_COMMS_FROM: temp } })
-  return $.process.run(['/bin/rm', '-f', temp])
-}
-
-/**
  * Creates folders with no command at all: a hidden `.keep` file in each
  * (writing creates the folders on the way). Readers skip dot-files.
  */
@@ -232,9 +208,10 @@ const ensureDirs = async ($: Engine, dirs: readonly string[]): Promise<string | 
 }
 
 /**
- * Writes `name` in `dir` so no reader sees half of it: a dot-named temp
- * file in the same folder, then a rename (moveFile). Never replaces an
- * existing file unless `replace` (channels.json).
+ * Writes `name` in `dir` with the file API alone; the plugin runs no programs.
+ * Never replaces an existing file unless `replace` (channels.json). A reader
+ * that catches a file mid-write finds JSON that does not parse yet: messages
+ * are re-read when their size or time changes, and channels.json reads retry.
  */
 const writeAtomic = async (
   $: Engine,
@@ -245,24 +222,37 @@ const writeAtomic = async (
 ): Promise<{ ok: true; path: string } | { ok: false; reason: string }> => {
   const final = `${dir}/${name}`
   if (!replace && (await $.fs.exists(final))) return { ok: false, reason: `${name} already exists` }
-  const temp = `${dir}/${tempNameFor(name, randomHex(4))}`
-  await $.fs.write(temp, text)
-  const moved = await moveFile($, temp, final, replace).catch(error => ({
-    exitCode: -1,
-    stdout: '',
-    stderr: String(error),
-  }))
-  if (moved.exitCode !== 0 || (await $.fs.exists(temp))) {
-    await removeTemp($, temp).catch(() => undefined)
-
-    return { ok: false, reason: `rename failed: ${moved.stderr.trim() || `exit ${moved.exitCode}`}` }
+  try {
+    await $.fs.write(final, text)
+  } catch (error) {
+    return { ok: false, reason: `write failed: ${String(error)}` }
   }
 
   return { ok: true, path: final }
 }
 
+/**
+ * channels.json's text, read again (up to three times, 150 ms apart) while it
+ * does not parse, in case another session is rewriting it at that moment.
+ */
+const readConfigText = async ($: Engine): Promise<string | undefined> => {
+  let text: string | undefined
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    text = await $.fs.read(paths.config()).catch(() => undefined)
+    if (text === undefined) return undefined
+    try {
+      JSON.parse(text)
+      return text
+    } catch {
+      await $.clock.sleep(150)
+    }
+  }
+
+  return text
+}
+
 const loadConfig = async ($: Engine): Promise<Config | undefined> => {
-  const text = await $.fs.read(paths.config()).catch(() => undefined)
+  const text = await readConfigText($)
   config = typeof text === 'string' ? parseConfig(text) : undefined
 
   return config
@@ -533,18 +523,8 @@ const deliver = async ($: Engine): Promise<void> => {
   return delivering
 }
 
-/**
- * One user-role row the model reads, in the next request from the loop's top.
- * TEST SEAM: `claude plugin test` in this build cannot answer
- * `session.append` (a test hook answering without `next` is skipped, and
- * nothing sits beneath `next`), so under AGENT_COMMS_TEST_DELIVERY_SINK=1 the
- * row goes to the debug log instead. Sessions never set it.
- */
+/** One delivered message, added to this session's conversation. */
 const appendRow = async ($: Engine, text: string): Promise<boolean> => {
-  if (testSink) {
-    $.ui.log(`deliver: ${text}`, { to: 'debug' })
-    return true
-  }
   const appended = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
 
   return appended.deny === undefined
@@ -913,26 +893,29 @@ const markSeen = async ($: Engine, ch: string) => {
 
 // ---- setup -----------------------------------------------------------
 
-const insideGit = async ($: Engine, dir: string): Promise<boolean | undefined> => {
+const insideGit = async ($: Engine, dir: string): Promise<boolean> => {
+  // a git work tree has a .git folder (or a .git file, in a worktree) at its top
   let probe = dir
-  while (probe !== '/' && !(await $.fs.exists(probe))) probe = parent(probe)
-  const result = await $.process.run(['git', '-C', probe, 'rev-parse', '--is-inside-work-tree']).catch(() => undefined)
-  if (result === undefined) return undefined
+  for (let depth = 0; depth < 64; depth += 1) {
+    if (await $.fs.exists(`${probe}/.git`)) return true
+    const up = parent(probe)
+    if (up === probe || up === '') return false
+    probe = up
+  }
 
-  return result.exitCode === 0 && result.stdout.trim() === 'true'
+  return false
 }
 
 const setup = async ($: Engine): Promise<string> => {
   const git = await insideGit($, root)
-  if (git === undefined) return `could not run git to check ${root}; nothing created.`
   if (git) {
-    return `${root} is inside a git work tree, so nothing was created. Pick a folder outside any git repository and set AGENT_COMMS_ROOT to it in the env block of ~/.claude/settings.json.`
+    return `${root} is inside a git work tree, so nothing was created. Pick a folder outside any git repository as the plugin's Comms folder setting (/config, or pluginConfigs in settings.json).`
   }
   const configPath = paths.config()
   const hadConfig = await $.fs.exists(configPath)
   let existing: Record<string, unknown> | undefined
   if (hadConfig) {
-    const text = await $.fs.read(configPath).catch(() => undefined)
+    const text = await readConfigText($)
     let value: unknown
     try {
       value = typeof text === 'string' ? JSON.parse(text) : undefined
@@ -1016,7 +999,7 @@ const createGroup = async ($: Engine, args: readonly string[]): Promise<string> 
   const configPath = paths.config()
   let cfg: Config | undefined
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const text = await $.fs.read(configPath).catch(() => undefined)
+    const text = await readConfigText($)
     if (typeof text !== 'string') return 'The folder is not set up yet: run /comms-setup first.'
     cfg = parseConfig(text)
     let raw: unknown
@@ -1092,7 +1075,7 @@ const registerAgent = async ($: Engine, id: string): Promise<AgentRegistration> 
   let added = false
   let cfg: Config | undefined
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const text = await $.fs.read(configPath).catch(() => undefined)
+    const text = await readConfigText($)
     if (typeof text !== 'string') return { ok: false, reason: 'the folder is not set up yet: run /comms-setup first.' }
     let raw: unknown
     try {
@@ -1287,112 +1270,112 @@ const approveByCode = async ($: Engine, code: string): Promise<string> => {
   return `✓ Approved: ${hit.m.from}'s ${hit.m.kind} to ${hit.m.to} on #${hit.ch}.`
 }
 
-export const register: Register = on => {
+// ---- the slash commands (files in commands/; answered here) ---------------
+
+const runCommsAs = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
+  if (!isPersonOrigin(e.origin)) return { text: '/comms-as is run by the person.' }
+  if (sessionId === undefined) await init($)
+  const id = e.args.trim()
+  if (id === '') {
+    return { text: me === undefined ? 'comms: not joined. Run /comms-as <id>: maintainer, reviewer, or an agent name (e.g. frontend or 42); /comms-as off leaves.' : `comms: this session is ${me}. /comms-as off leaves.` }
+  }
+  if (id === 'off') return { text: await leave($) }
+  let cfg = await loadConfig($)
+  const allowed = knownIds(cfg)
+  allowed.delete(REVIEWER)
+  // `reviewer` moves from chat to chat: /comms-as reviewer in the new one, /comms-as off in the old one.
+  // A named reviewer (reviewer3) also joins every channel with a reviewer slot.
+  const isAnyReviewer = isId(id) && isReviewer(id)
+  const lookalike = allowed.has(id) || isAnyReviewer ? undefined : lookalikeOf(id)
+  if (lookalike !== undefined) return { text: `"${id}" looks like a typo: did you mean /comms-as ${lookalike}?` }
+  if (!isId(id) || (!allowed.has(id) && !isNewAgentId(id, cfg) && !isAnyReviewer)) {
+    return {
+      text: `"${id}" is not an id this session can take: use maintainer, reviewer, or an agent name of letters, digits, - or _ (not "all", and not the name of a group).`,
+    }
+  }
+  let registered = ''
+  if (id !== MAINTAINER && !isReviewer(id) && cfg !== undefined) {
+    const registration = await registerAgent($, id)
+    if (!registration.ok) return { text: `not joined: ${registration.reason}` }
+    cfg = config
+    const made = registration.channels.map(c => `channels/${c.id}/`).join(', ')
+    registered = registration.added
+      ? ` Registered ${id}: added channel #${id} (reviewer, ${id}) to channels.json and created ${made}${registration.notes > 0 ? ' with its setup note' : ''}.`
+      : registration.notes > 0 ? ` Wrote the setup note in ${made}.` : ''
+  }
+  me = id
+  await $.store.set(identityKey(), id)
+  await join($)
+  const where = cfg === undefined ? ' The folder is not set up yet: /comms-setup.' : ''
+  const what = id === MAINTAINER
+    ? '/comms opens the pane.'
+    : isReviewer(id)
+    ? `Reviewer in ${cfg ? channelsFor(cfg, id).map(c => `#${c.id}`).join(', ') || 'no channel' : 'every channel with a reviewer slot'}; its messages to agents wait for the maintainer's approval. Tools comms_read and comms_post are available to the model from the next prompt.${cfg?.reviewer_mode === 'chat' ? ' Note: channels.json says the reviewer is a Chat agent (reviewer_mode "chat"), so this session is not woken by messages; set reviewer_mode to "code" to have it woken.' : ' Messages to the reviewer wake this session.'}`
+    : `Channels: ${cfg ? channelsFor(cfg, id).map(c => `#${c.id}`).join(', ') || 'none' : 'unknown'}; tools comms_read and comms_post are available to the model from the next prompt.`
+
+  return { text: `comms: this session is ${id}.${registered} ${what}${where}` }
+}
+
+const runComms = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
+  if (!isPersonOrigin(e.origin)) return { text: '/comms is run by the person.' }
+  if (me !== MAINTAINER) {
+    return { text: `the pane is the maintainer's. ${me === undefined ? 'Run /comms-as maintainer first.' : `This session is ${me}; run /comms-as maintainer in your own session.`}` }
+  }
+  await scan($)
+  const opened = await $.ui.open({ id: PANE, title: 'agent-comms' })
+  const surfaces: readonly string[] = await $.session.surfaces().catch(() => [])
+  const placed = opened.isPlaced ? 'agent-comms pane opened.' : `agent-comms pane not placed: ${opened.reason}`
+  // the mobile app draws no plugin pane: the conversations come as this reply instead
+  if (!surfaces.includes('mobile')) return { text: placed }
+
+  return { text: `${placed}\n\n${await phoneSummary($)}` }
+}
+
+const runCommsApprove = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
+  if (!isPersonOrigin(e.origin)) return { text: '/comms-approve is run by the person.' }
+  if (me !== MAINTAINER) return { text: 'approving is the maintainer\'s: run /comms-as maintainer first.' }
+
+  return { text: await approveByCode($, e.args.trim().toLowerCase()) }
+}
+
+const runCommsGroup = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
+  if (!isPersonOrigin(e.origin)) return { text: '/comms-group is run by the person.' }
+  if (sessionId === undefined) await init($)
+
+  return { text: await createGroup($, e.args.trim().split(/[\s,]+/).filter(Boolean)) }
+}
+
+const runCommsSetup = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
+  if (!isPersonOrigin(e.origin)) return { text: '/comms-setup is run by the person.' }
+  if (sessionId === undefined) await init($)
+
+  return { text: await setup($) }
+}
+
+export const register: Register = (on, options) => {
+  folderOption = typeof options.folder === 'string' ? options.folder.trim() : ''
   // ---- hooks -----------------------------------------------------------
 
   on('session.start', async ($, e, next) => {
     await init($)
-    await $.command.register({ name: 'comms', description: 'agent-comms: open the maintainer pane (channels, approvals, posting)' })
-    await $.command.register({
-      name: 'comms-as',
-      description: 'agent-comms: set this session\'s identity (maintainer, or an agent\'s PR number; a new one gets its own channel and folder)',
-      argumentHint: '<id>',
-    })
-    await $.command.register({ name: 'comms-setup', description: 'agent-comms: create the comms folder and channels.json (asks first)' })
-    await $.command.register({
-      name: 'comms-group',
-      description: 'agent-comms: create a group chat of agents and the reviewer, e.g. /comms-group team-a frontend backend',
-      argumentHint: '<name> <agent> <agent> …',
-    })
-    await $.command.register({
-      name: 'comms-approve',
-      description: 'agent-comms: approve a reviewer message by the code /comms shows (for the phone)',
-      argumentHint: '<code>',
-    })
+    // the commands themselves are commands/*.md, so the directory lists them; the hooks below answer them
     await join($)
 
     return next(e)
   })
 
-  on('command.run', { command: 'comms-as' }, async ($, e) => {
-    if (!isPersonOrigin(e.origin)) return { text: '/comms-as is run by the person.' }
-    if (sessionId === undefined) await init($)
-    const id = e.args.trim()
-    if (id === '') {
-      return { text: me === undefined ? 'comms: not joined. Run /comms-as <id>: maintainer, reviewer, or an agent name (e.g. frontend or 42); /comms-as off leaves.' : `comms: this session is ${me}. /comms-as off leaves.` }
-    }
-    if (id === 'off') return { text: await leave($) }
-    let cfg = await loadConfig($)
-    const allowed = knownIds(cfg)
-    allowed.delete(REVIEWER)
-    // `reviewer` moves from chat to chat: /comms-as reviewer in the new one, /comms-as off in the old one.
-    // A named reviewer (reviewer3) also joins every channel with a reviewer slot.
-    const isAnyReviewer = isId(id) && isReviewer(id)
-    const lookalike = allowed.has(id) || isAnyReviewer ? undefined : lookalikeOf(id)
-    if (lookalike !== undefined) return { text: `"${id}" looks like a typo: did you mean /comms-as ${lookalike}?` }
-    if (!isId(id) || (!allowed.has(id) && !isNewAgentId(id, cfg) && !isAnyReviewer)) {
-      return {
-        text: `"${id}" is not an id this session can take: use maintainer, reviewer, or an agent name of letters, digits, - or _ (not "all", and not the name of a group).`,
-      }
-    }
-    let registered = ''
-    if (id !== MAINTAINER && !isReviewer(id) && cfg !== undefined) {
-      const registration = await registerAgent($, id)
-      if (!registration.ok) return { text: `not joined: ${registration.reason}` }
-      cfg = config
-      const made = registration.channels.map(c => `channels/${c.id}/`).join(', ')
-      registered = registration.added
-        ? ` Registered ${id}: added channel #${id} (reviewer, ${id}) to channels.json and created ${made}${registration.notes > 0 ? ' with its setup note' : ''}.`
-        : registration.notes > 0 ? ` Wrote the setup note in ${made}.` : ''
-    }
-    me = id
-    await $.store.set(identityKey(), id)
-    await join($)
-    const where = cfg === undefined ? ' The folder is not set up yet: /comms-setup.' : ''
-    const what = id === MAINTAINER
-      ? '/comms opens the pane.'
-      : isReviewer(id)
-      ? `Reviewer in ${cfg ? channelsFor(cfg, id).map(c => `#${c.id}`).join(', ') || 'no channel' : 'every channel with a reviewer slot'}; its messages to agents wait for the maintainer's approval. Tools comms_read and comms_post are available to the model from the next prompt.${cfg?.reviewer_mode === 'chat' ? ' Note: channels.json says the reviewer is a Chat agent (reviewer_mode "chat"), so this session is not woken by messages; set reviewer_mode to "code" to have it woken.' : ' Messages to the reviewer wake this session.'}`
-      : `Channels: ${cfg ? channelsFor(cfg, id).map(c => `#${c.id}`).join(', ') || 'none' : 'unknown'}; tools comms_read and comms_post are available to the model from the next prompt.`
-
-    return { text: `comms: this session is ${id}.${registered} ${what}${where}` }
-  })
-
-  on('command.run', { command: 'comms' }, async ($, e) => {
-    if (!isPersonOrigin(e.origin)) return { text: '/comms is run by the person.' }
-    if (me !== MAINTAINER) {
-      return { text: `the pane is the maintainer's. ${me === undefined ? 'Run /comms-as maintainer first.' : `This session is ${me}; run /comms-as maintainer in your own session.`}` }
-    }
-    await scan($)
-    const opened = await $.ui.open({ id: PANE, title: 'agent-comms' })
-    const surfaces: readonly string[] = await $.session.surfaces().catch(() => [])
-    const placed = opened.isPlaced ? 'agent-comms pane opened.' : `agent-comms pane not placed: ${opened.reason}`
-    // the mobile app draws no plugin pane: the conversations come as this reply instead
-    if (!surfaces.includes('mobile')) return { text: placed }
-
-    return { text: `${placed}\n\n${await phoneSummary($)}` }
-  })
-
-  on('command.run', { command: 'comms-approve' }, async ($, e) => {
-    if (!isPersonOrigin(e.origin)) return { text: '/comms-approve is run by the person.' }
-    if (me !== MAINTAINER) return { text: 'approving is the maintainer\'s: run /comms-as maintainer first.' }
-
-    return { text: await approveByCode($, e.args.trim().toLowerCase()) }
-  })
-
-  on('command.run', { command: 'comms-group' }, async ($, e) => {
-    if (!isPersonOrigin(e.origin)) return { text: '/comms-group is run by the person.' }
-    if (sessionId === undefined) await init($)
-
-    return { text: await createGroup($, e.args.trim().split(/[\s,]+/).filter(Boolean)) }
-  })
-
-  on('command.run', { command: 'comms-setup' }, async ($, e) => {
-    if (!isPersonOrigin(e.origin)) return { text: '/comms-setup is run by the person.' }
-    if (sessionId === undefined) await init($)
-
-    return { text: await setup($) }
-  })
+  // /comms-as and the rest: each is answered here and never reaches the model. A plugin's
+  // command can arrive under its plain name or as agent-comms:<name>, so both are matched.
+  on('command.run', { command: 'comms-as' }, runCommsAs)
+  on('command.run', { command: 'agent-comms:comms-as' }, runCommsAs)
+  on('command.run', { command: 'comms' }, runComms)
+  on('command.run', { command: 'agent-comms:comms' }, runComms)
+  on('command.run', { command: 'comms-approve' }, runCommsApprove)
+  on('command.run', { command: 'agent-comms:comms-approve' }, runCommsApprove)
+  on('command.run', { command: 'comms-group' }, runCommsGroup)
+  on('command.run', { command: 'agent-comms:comms-group' }, runCommsGroup)
+  on('command.run', { command: 'comms-setup' }, runCommsSetup)
+  on('command.run', { command: 'agent-comms:comms-setup' }, runCommsSetup)
 
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as Record<string, unknown>

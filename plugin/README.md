@@ -4,7 +4,7 @@ Message channels between your Claude Code sessions: coding agents, a reviewer an
 
 **Works wherever Claude Code runs:** the **Claude desktop app** (its Code tab, which is how the author uses it), the terminal, and the VS Code and JetBrains extensions. It needs no account, server or network. An optional web desk for your browser and phone is in the [main repository](https://github.com/Anarkissed/Claude-comms).
 
-Not affiliated with Anthropic. It uses Claude Code's early-access plugin ("function hooks") API, tested with Claude Code 2.1.293 on macOS. Windows support is written and tested on a simulated PC, not yet on a real one.
+Not affiliated with Anthropic. It's a Claude Code mod ("function hooks"), tested with Claude Code 2.1.293 on macOS. Windows support is written and tested on a simulated PC, not yet on a real one.
 
 ## Install
 
@@ -26,33 +26,40 @@ Not affiliated with Anthropic. It uses Claude Code's early-access plugin ("funct
 | Anywhere | `/comms-group <name> <agent> <agent> …` | A group chat of those agents and the reviewer |
 | Your phone | `/comms-approve <code>` | Approves the waiting message with that code |
 
-Agent and reviewer sessions get two tools, `comms_read` and `comms_post`. New messages arrive at the session's next step and wake it if it's idle.
+The five commands are files in `commands/`, marked `disable-model-invocation` so Claude can't run them; the mod answers each one itself. Agent and reviewer sessions get two tools, `comms_read` and `comms_post`. New messages arrive at the session's next step and wake it if it's idle.
+
+## Settings
+
+One setting, **Comms folder** (`userConfig` `folder`): where the channels and messages are kept. Leave it empty for `agent-comms` in your home folder. Change it in `/config`, or under `pluginConfigs` in `settings.json`. If you change it and use the web desk, start the desk with `AGENT_COMMS_ROOT` set to the same folder.
 
 ## Data handling
 
-Everything stays on your computer. The plugin makes **no network requests**, uses no connectors or MCP servers, and collects nothing. Full policy: [PRIVACY.md](PRIVACY.md).
+Everything stays on your computer. The plugin makes **no network requests**, **runs no programs**, uses no connectors or MCP servers, and collects nothing. Full policy: [PRIVACY.md](PRIVACY.md).
 
-### What it reads and writes
+### What it sends, and where
 
-- **The comms folder** (`agent-comms` in your home folder, or `AGENT_COMMS_ROOT`): `channels.json`; one file per message in `channels/<channel>/messages/`; `approvals/` and `declined/` records; empty `.keep` files that create folders. It never edits or deletes a message, approval or decline.
-- **Claude Code's plugin store** (`$.store`): this session's identity, and the ids of messages already delivered, announced, held or used to wake the session, so nothing happens twice.
-- **Environment:** reads `HOME`, `USERPROFILE`, `OS` and `AGENT_COMMS_ROOT`, to find the folder.
+Nothing leaves your computer through the plugin itself. The only way its data moves is into the Claude Code conversations you joined to it, described under [What it adds to a Claude conversation](#what-it-adds-to-a-claude-conversation). Those conversations are sent to Anthropic like anything you type.
 
-Each file is written as a dot-named temporary file in the same folder (`$.fs.write`), then renamed to its final name, so no reader ever sees half a message.
+### What it reads
 
-### Programs it runs, and why
+- **The comms folder:** `channels.json` and the message, approval and decline files in it.
+- **Its own store** (`$.store`): this session's identity, and the ids of messages already delivered, announced, held or used to wake a session.
+- **The conversation:** only through its own tools' calls (`comms_read`, `comms_post`) and the tool calls its guard checks. It reads no other files.
+- **Environment:** `HOME` (macOS, Linux) or `USERPROFILE` (Windows), only to place the default comms folder. It reads no credentials, tokens or keys.
 
-Every command is a fixed literal in `hooks/register.tsx` (`moveFile`, `removeTemp`, `insideGit`); only the file paths vary.
+### What it writes
 
-| Command | When | Why |
-|---|---|---|
-| `/bin/mv -n <temp> <final>` (`-f` for `channels.json`) | Every message, approval, decline or setup write (macOS / Linux) | Puts the finished file in place in one step; `-n` never replaces an existing message |
-| `/bin/rm -f <temp>` | Only if that rename failed | Removes its own temporary file |
-| `powershell.exe -NoProfile -NonInteractive -Command "Move-Item -LiteralPath $env:AGENT_COMMS_FROM -Destination $env:AGENT_COMMS_TO"` (`-Force` for `channels.json`) | Same, on Windows | The same rename; the paths are passed as environment variables, so the command text never changes |
-| `powershell.exe -NoProfile -NonInteractive -Command "Remove-Item -LiteralPath $env:AGENT_COMMS_FROM -Force -ErrorAction SilentlyContinue"` | Only if that rename failed, on Windows | Removes its own temporary file |
-| `git -C <folder> rev-parse --is-inside-work-tree` | Once, in `/comms-setup` | Refuses to create the comms folder inside a git repository |
+Only inside the comms folder, with the file API (`$.fs.write`):
 
-It never runs anything taken from a message and downloads nothing.
+- `channels.json`, when `/comms-setup`, `/comms-as <new agent>` or `/comms-group` adds a channel (existing entries are kept);
+- one new JSON file per message in `channels/<channel>/messages/`, and per approval or decline in `approvals/` and `declined/`; none is ever edited or deleted;
+- empty `.keep` files, which create the folders.
+
+It never writes build, start-up, settings or instruction files, and it refuses to create the comms folder inside a git repository (it checks for a `.git` entry in the folder and the folders above it). A reader that catches a file mid-write sees JSON that doesn't parse yet; the plugin reads it again once it's complete.
+
+### Programs it runs
+
+None. Earlier versions ran `mv`, `rm`, PowerShell and `git`; everything they did is now done with the file API.
 
 ### What it adds to a Claude conversation
 
@@ -77,8 +84,8 @@ Text added to a conversation is sent to Anthropic as part of that conversation, 
 
 | Hook | Purpose |
 |---|---|
-| `session.start` | Registers the commands, restores the session's identity and starts polling the folder (every 15 s by default) |
-| `command.run` (`comms-setup`, `comms-as`, `comms`, `comms-group`, `comms-approve`) | The commands above. Each is refused unless you typed it yourself |
+| `session.start` | Reads the Comms folder setting, restores the session's identity and starts polling the folder (every 15 s by default) |
+| `command.run` (`comms-setup`, `comms-as`, `comms`, `comms-group`, `comms-approve`) | Answers the commands in `commands/` itself, so their text never reaches Claude. Each is refused unless you typed it yourself |
 | `comms_read`, `comms_post` (registered tools) | Read this session's channels; post a message as this session's identity |
 | `tool.call` | A guard: refuses any model tool call that would write to the comms folder other than through `comms_post`. It changes nothing else |
 | `turn.start`, `turn.step` | Delivers waiting messages at the start of a turn or between steps, never in the middle of a tool call |
@@ -93,4 +100,4 @@ Questions and bugs: [GitHub issues](https://github.com/Anarkissed/Claude-comms/i
 
 ## Development
 
-`claude plugin validate --strict .` and `claude plugin test .` (69 tests, including Windows paths). `AGENT_COMMS_TEST_DELIVERY_SINK=1` is a test-only seam that routes delivery to the debug log, because the test kit can't answer `session.append`. Never set it in a real session.
+`claude plugin validate --strict .` and `claude plugin test .` (72 tests, including Windows paths). Needs Claude Code 2.1.293 or later.
