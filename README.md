@@ -6,6 +6,8 @@
 
 Run several Claude Code agents on one project, have a reviewer (another Claude session) review their work, and stay in the loop: every message the reviewer sends to an agent waits for your **Approve** before the agent sees it. Agents and the reviewer write to each other through a plain folder of JSON files on your machine. There's no server in the cloud, no account and no network service, and you read and approve from a chat-style page on your Mac or your phone.
 
+**Works in the Claude desktop app** (its Code tab), as well as Claude Code in the terminal and in VS Code or JetBrains. The plugin itself, with its own docs, privacy policy and terms, is the [`plugin/`](plugin/) folder.
+
 > Independent community project. It is **not** made by, endorsed by or affiliated with Anthropic. It uses Claude Code's early-access plugin ("function hooks") API, which can change between Claude Code releases. Tested with Claude Code 2.1.293 on macOS. **Windows support is new and hasn't been tried on a real PC yet; please open an issue if something doesn't work.** See [PRIVACY.md](PRIVACY.md) for what it reads, writes and sends.
 
 ## What you get
@@ -81,7 +83,8 @@ Double-click `web/Agent Comms.command` (this Mac only) or `web/Agent Comms (phon
 - **No network requests.**
 - **Local commands only**, all on the comms folder:
   - **macOS / Linux:** `/bin/mv` to put each message in place in one step (no reader ever sees half a file), and `/bin/rm -f` to remove its own temporary file if that fails.
-  - **Windows:** PowerShell's `Move-Item` and `Remove-Item` for the same two jobs.
+  - **Windows:** PowerShell's `Move-Item` and `Remove-Item` for the same two jobs, with the paths passed as environment variables so the command text is fixed.
+  - The exact commands are listed in [plugin/README.md](plugin/README.md#programs-it-runs-and-why).
   - **Everywhere:** `git rev-parse --is-inside-work-tree`, once during `/comms-setup`, so the folder isn't created inside a git repository.
 - **Folders** are created by writing an empty `.keep` file, with no command.
 - **Nothing else:** it never runs anything taken from a message, downloads nothing, and declares no MCP servers.

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
+import type { EngineInterface, ProcessRunResult, Register, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
 
 import type { CommsChannelRow, CommsThreadItem } from '../types'
 import {
@@ -195,23 +195,28 @@ const listSafe = async ($: Engine, dir: string) => {
   }
 }
 
-/** A PowerShell single-quoted string: a ' inside it is written twice. */
-const psQuote = (text: string): string => `'${text.replace(/'/g, "''")}'`
-
 /**
- * Renames `from` to `to`: `/bin/mv` on macOS and Linux (rename(2)), PowerShell's
- * Move-Item on Windows (MoveFileEx). Without `replace`, an existing `to` is kept
- * (`mv -n`; Move-Item refuses without -Force).
+ * The only programs the plugin runs besides `git rev-parse` in /comms-setup.
+ * Every command is a fixed literal; only the two file paths vary. On Windows the
+ * paths reach PowerShell as environment variables, so its command text never changes.
+ *
+ * Renames `from` to `to` in one step: `/bin/mv` on macOS and Linux (rename(2)),
+ * PowerShell's Move-Item on Windows (MoveFileEx). Without `replace`, an existing
+ * `to` is kept (`mv -n`; Move-Item refuses without -Force).
  */
-const moveFile = (from: string, to: string, replace: boolean): readonly string[] =>
-  windows
-    ? ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', `Move-Item -LiteralPath ${psQuote(from)} -Destination ${psQuote(to)}${replace ? ' -Force' : ''}`]
-    : ['/bin/mv', replace ? '-f' : '-n', from, to]
+const moveFile = async ($: Engine, from: string, to: string, replace: boolean): Promise<ProcessRunResult> => {
+  const env = { AGENT_COMMS_FROM: from, AGENT_COMMS_TO: to }
+  if (windows && replace) return $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'Move-Item -LiteralPath $env:AGENT_COMMS_FROM -Destination $env:AGENT_COMMS_TO -Force'], { env })
+  if (windows) return $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'Move-Item -LiteralPath $env:AGENT_COMMS_FROM -Destination $env:AGENT_COMMS_TO'], { env })
+  if (replace) return $.process.run(['/bin/mv', '-f', from, to])
+  return $.process.run(['/bin/mv', '-n', from, to])
+}
 
-const removeFile = (path: string): readonly string[] =>
-  windows
-    ? ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', `Remove-Item -LiteralPath ${psQuote(path)} -Force -ErrorAction SilentlyContinue`]
-    : ['/bin/rm', '-f', path]
+/** Deletes the plugin's own temporary file after a failed rename. Nothing else is ever deleted. */
+const removeTemp = async ($: Engine, temp: string): Promise<ProcessRunResult> => {
+  if (windows) return $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', 'Remove-Item -LiteralPath $env:AGENT_COMMS_FROM -Force -ErrorAction SilentlyContinue'], { env: { AGENT_COMMS_FROM: temp } })
+  return $.process.run(['/bin/rm', '-f', temp])
+}
 
 /**
  * Creates folders with no command at all: a hidden `.keep` file in each
@@ -242,13 +247,13 @@ const writeAtomic = async (
   if (!replace && (await $.fs.exists(final))) return { ok: false, reason: `${name} already exists` }
   const temp = `${dir}/${tempNameFor(name, randomHex(4))}`
   await $.fs.write(temp, text)
-  const moved = await $.process.run(moveFile(temp, final, replace)).catch(error => ({
+  const moved = await moveFile($, temp, final, replace).catch(error => ({
     exitCode: -1,
     stdout: '',
     stderr: String(error),
   }))
   if (moved.exitCode !== 0 || (await $.fs.exists(temp))) {
-    await $.process.run(removeFile(temp)).catch(() => undefined)
+    await removeTemp($, temp).catch(() => undefined)
 
     return { ok: false, reason: `rename failed: ${moved.stderr.trim() || `exit ${moved.exitCode}`}` }
   }

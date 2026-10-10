@@ -1,10 +1,18 @@
 {
   "name": "agent-comms",
   "version": "0.1.0",
-  "description": "Per-agent message channels with the reviewer, kept as JSON files in a local folder; reviewer messages reach an agent only after the maintainer approves them.",
+  "description": "Message channels between your Claude Code sessions (coding agents, a reviewer and you), kept as JSON files in a local folder; a reviewer's message reaches an agent only after you approve it. Works in the Claude desktop app's Code tab, the terminal and IDEs.",
   "author": {
-    "name": "Anarkissed"
+    "name": "Anarkissed",
+    "url": "https://github.com/Anarkissed"
   },
+  "homepage": "https://github.com/Anarkissed/Claude-comms/tree/main/plugin",
+  "repository": "https://github.com/Anarkissed/Claude-comms",
+  "documentationUrl": "https://github.com/Anarkissed/Claude-comms/blob/main/plugin/README.md",
+  "privacyPolicyUrl": "https://github.com/Anarkissed/Claude-comms/blob/main/plugin/PRIVACY.md",
+  "termsOfServiceUrl": "https://github.com/Anarkissed/Claude-comms/blob/main/plugin/TERMS.md",
+  "supportUrl": "https://github.com/Anarkissed/Claude-comms/issues",
+  "license": "MIT",
   "icon": "./icon.svg",
   "types": "./types/index.d.ts"
 }

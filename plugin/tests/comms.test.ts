@@ -145,8 +145,8 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     }
     return { value: stat }
   })
-  on('process.run', ($, e) => ({ value: { ...runCommand([...e.argv]), isStdoutTruncated: false, isStderrTruncated: false } }))
-  const runCommand = (argv: string[]): { exitCode: number; stdout: string; stderr: string } => {
+  on('process.run', ($, e) => ({ value: { ...runCommand([...e.argv], e.init?.env ?? {}), isStdoutTruncated: false, isStderrTruncated: false } }))
+  const runCommand = (argv: string[], env: Record<string, string>): { exitCode: number; stdout: string; stderr: string } => {
     w.ran.push(argv)
     const ok = { exitCode: 0, stdout: '', stderr: '' }
     if (argv[0] === '/bin/mv') {
@@ -171,20 +171,21 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     }
     if (argv[0] === 'powershell.exe') {
       const command = argv[argv.length - 1] ?? ''
-      const unquote = (q: string) => q.slice(1, -1).replace(/''/g, "'")
-      const move = /^Move-Item -LiteralPath ('(?:[^']|'')*') -Destination ('(?:[^']|'')*')( -Force)?$/.exec(command)
+      // the command text is fixed; the paths come in as environment variables
+      const move = /^Move-Item -LiteralPath \$env:AGENT_COMMS_FROM -Destination \$env:AGENT_COMMS_TO( -Force)?$/.exec(command)
       if (move) {
-        const from = unquote(move[1] ?? ''), to = unquote(move[2] ?? '')
+        const from = env.AGENT_COMMS_FROM ?? '', to = env.AGENT_COMMS_TO ?? ''
+        if (from === '' || to === '') return { ...ok, exitCode: 1, stderr: 'Cannot bind argument to parameter' }
         const text = files.get(real(from))
         if (text === undefined) return { ...ok, exitCode: 1, stderr: 'Cannot find path' }
-        if (!move[3] && files.has(real(to))) return { ...ok, exitCode: 1, stderr: 'Cannot create a file when that file already exists.' }
+        if (!move[1] && files.has(real(to))) return { ...ok, exitCode: 1, stderr: 'Cannot create a file when that file already exists.' }
         files.delete(real(from))
         put(real(to), text)
         return ok
       }
-      const remove = /^Remove-Item -LiteralPath ('(?:[^']|'')*') -Force -ErrorAction SilentlyContinue$/.exec(command)
+      const remove = /^Remove-Item -LiteralPath \$env:AGENT_COMMS_FROM -Force -ErrorAction SilentlyContinue$/.exec(command)
       if (remove) {
-        files.delete(real(unquote(remove[1] ?? '')))
+        files.delete(real(env.AGENT_COMMS_FROM ?? ''))
         return ok
       }
       return { ...ok, exitCode: 1, stderr: `unexpected PowerShell: ${command}` }
@@ -1293,7 +1294,7 @@ describe('Windows (the plugin on a PC)', () => {
     expect(denial(posted)).toBeUndefined()
     const [path] = [...w.files.keys()].filter(p => p.startsWith(`${winMsg('358')}/`))
     expect(parse(w.files.get(path ?? '') ?? '', nameOf(path ?? '').slice(0, -5))).toMatchObject({ ok: true })
-    expect(w.ran.some(a => a[0] === 'powershell.exe' && (a.at(-1) ?? '').startsWith('Move-Item -LiteralPath '))).toBe(true)
+    expect(w.ran.some(a => a[0] === 'powershell.exe' && (a.at(-1) ?? '').startsWith('Move-Item -LiteralPath $env:AGENT_COMMS_FROM '))).toBe(true)
     expect(w.ran.some(a => (a[0] ?? '').startsWith('/bin/'))).toBe(false)
     expect([...w.files.keys()].some(p => p.endsWith('.tmp'))).toBe(false)
   })
