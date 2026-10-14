@@ -2768,3 +2768,61 @@ describe('fifth review fixes (2026-10-14)', () => {
     await ui.unmount()
   })
 })
+
+describe('sixth review fixes (2026-10-14)', () => {
+  const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
+    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+  const filesIn = (w: World, ch: string) =>
+    [...w.files.entries()]
+      .filter(([p]) => p.startsWith(`${msgDir(ch)}/`))
+      .flatMap(([p, text]) => {
+        const r = parse(text, nameOf(p).slice(0, -5))
+        return r.ok ? [r.message] : []
+      })
+
+  test('a decline file that does not parse does not stop a Hold', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'bad decline file', at: T0 - 1000, hex: 'f10001' })
+    put(w, `${ROOT}/channels/358/declined/${m.id}.json`, `{"id":"${m.id}","by":"reviewer","ts":"x"}\n`)
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `hold:${m.id}` })
+    expect(filesIn(w, '358').filter(n => n.body.startsWith('On hold'))).toHaveLength(2)
+    await ui.unmount()
+  })
+
+  test('a delivery whose id has a space or parentheses is found by the rewind check, not sent again', async ($, on) => {
+    const base = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'odd name', nowMs: T0 - 1000, hex: 'f10002' })
+    const m = { ...base, id: `${base.id} (copy)` }
+    const w = world(on, {
+      identity: '358',
+      messages: [deliveryText('358', m, false)],
+      store: { 'delivered:S1:358': [m.id], 'recent:S1': [{ ch: '358', id: m.id }] },
+    })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    await start($)
+    await turn($, 1)
+    expect(w.appended.filter(t => t.includes('odd name'))).toHaveLength(0)
+  })
+
+  test('a Decline that lands while the other desk finishes the hold still tells the agent nothing is coming', async ($, on) => {
+    let w: World | undefined
+    let id = ''
+    w = world(on, {
+      identity: 'maintainer',
+      onWrite: p => {
+        // the web desk tells the agent (and records it) while this pane is recording its decline
+        if (p.includes('/channels/358/declined/') && w !== undefined) put(w, `${ROOT}/channels/358/held/${id}.json`, `{"id":"${id}","by":"maintainer","ts":"2026-10-03T12:00:00.000Z","told":["reviewer","358"]}\n`)
+      },
+    })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'race', at: T0 - 1000, hex: 'f10003' })
+    id = m.id
+    put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T12:00:00.000Z","told":["reviewer"]}\n`)
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `decline-open:${m.id}` })
+    await ui.input({ key: `decline:${m.id}`, text: 'no' })
+    expect(filesIn(w, '358').some(n => n.to === '358' && n.body.includes('Nothing is coming'))).toBe(true)
+    await ui.unmount()
+  })
+})

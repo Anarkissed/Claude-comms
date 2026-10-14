@@ -528,7 +528,7 @@ class Folder:
             return f"Already on hold; {m['from']} and {agent_side} were told."
         for r in missing:
             # declined from another desk meanwhile: no promise of word is sent after it
-            if os.path.exists(os.path.join(self.channel_dir(ch, "declined"), mid + ".json")):
+            if mid in self._records(ch, "declined"):  # a decline that parses
                 return "Not held further: it was declined meanwhile."
             if r == ALL:
                 # the group is told something waits, never what it says (the text is not approved); "all" reaches the reviewer too

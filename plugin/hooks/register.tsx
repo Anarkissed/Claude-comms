@@ -345,7 +345,7 @@ const recheckDeliveries = async ($: Engine) => {
     .join('\n')
     .replace(/^----- message body ([0-9a-f]+) -----$[\s\S]*?^----- end of message \1 -----$/gm, '')
   const found = new Set<string>()
-  for (const header of text.matchAll(/^\[agent-comms\] Message on channel #(\S+) from .*\(id ([^()\s]+)\)\.$/gm)) found.add(`${header[1]}/${header[2]}`)
+  for (const header of text.matchAll(/^\[agent-comms\] Message on channel #(\S+) from .*\(id (.+)\)\.$/gm)) found.add(`${header[1]}/${header[2]}`)
   // A rewind removes the END of the conversation, so only deliveries after the last one still found are
   // lost. (The api form keeps the newest 4096 rows of a longer conversation: its START may be missing.)
   let lastFound = -1
@@ -1675,8 +1675,9 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
       : `On hold: ${withArticle(m.kind)} from ${m.from} to you is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.`
   let failed: string | undefined
   for (const r of missing) {
-    // declined from another desk meanwhile: no promise of word is sent after it
-    if (await $.fs.exists(`${paths.declined(ch)}/${id}.json`).catch(() => false)) {
+    // declined from another desk meanwhile (a decline that parses): no promise of word is sent after it
+    const declinedText = await $.fs.read(`${paths.declined(ch)}/${id}.json`).catch(() => undefined)
+    if (typeof declinedText === 'string' && parseDecline(declinedText, id) !== undefined) {
       failed = 'it was declined meanwhile'
       break
     }
@@ -1741,9 +1742,11 @@ const declineOnce = async ($: Engine, ch: string, id: string, reason: string) =>
     return
   }
   const agentRecipient = m.to === ALL ? ALL : m.to
-  const record = scanned.held.get(id)
-  const wasHeld = (scanned.held.has(id) && (record === undefined || record.includes(agentRecipient))) ||
-    (!scanned.held.has(id) && (await readHeld($).catch(() => new Set<string>())).has(id))
+  // the hold record read again now the decline is recorded: a hold finished from another desk meanwhile counts
+  const heldNow = await $.fs.exists(`${paths.held(ch)}/${id}.json`).catch(() => scanned.held.has(id))
+  const record = heldNow ? (await readHeldRecord($, ch, id))?.told : undefined
+  const wasHeld = (heldNow && (record === undefined || record.includes(agentRecipient))) ||
+    (!heldNow && (await readHeld($).catch(() => new Set<string>())).has(id))
   const reasonLine = `Reason: ${why || '(no reason given)'}`
   const toWhom = m.to === ALL ? `the group #${ch}` : m.to
   const agentSide = m.to === ALL ? 'the group' : m.to

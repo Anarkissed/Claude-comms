@@ -123,4 +123,4 @@ Questions and bugs: [GitHub issues](https://github.com/Anarkissed/Claude-comms/i
 
 ## Development
 
-`claude plugin validate --strict .` and `claude plugin test .` (178 tests, including Windows paths). Needs Claude Code 2.1.293 or later.
+`claude plugin validate --strict .` and `claude plugin test .` (181 tests, including Windows paths). Needs Claude Code 2.1.293 or later.

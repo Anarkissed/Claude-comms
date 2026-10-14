@@ -648,6 +648,13 @@ class FourthReviewTests(World):
         self.assertEqual([n for n in self.on_hold() if n["to"] == "358"], [])
 
 
+    def test_a_decline_file_that_does_not_parse_does_not_stop_a_hold(self):
+        m = self.seed("358", "reviewer", "358", "bad decline file", hexid="r6a001")
+        core.write_atomic(self.folder.channel_dir("358", "declined"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "reviewer", "ts": "x"}) + "\n")
+        self.assertTrue(self.folder.hold("358", m["id"]).startswith("⏸ On hold"))
+        self.assertEqual(len(self.on_hold()), 2)
+
+
 class NoHardLinkTests(World):
     def test_a_drive_without_hard_links_still_writes_atomically_and_never_clobbers(self):
         real_link = os.link
