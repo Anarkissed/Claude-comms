@@ -45,7 +45,7 @@ import qr  # noqa: E402
 
 MAX_BODY = 1_000_000
 # Bumped with every change to the page/server pair; the page compares it and asks for a restart when they differ.
-SERVER_VERSION = "2026-10-14.1"
+SERVER_VERSION = "2026-10-14.2"
 CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # no 0/O, 1/I: easy to type on a phone
 MAX_PAIR_FAILURES = 5
 COOKIE = "comms_session"

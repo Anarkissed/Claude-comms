@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import comms_core as core
 import qr
@@ -544,6 +545,83 @@ class SurrogateServerTests(ServerTests):
         status, data = self.request("GET", "/api/state", headers={"X-Comms-Token": self.token})
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(data)["ok"])
+
+
+class FourthReviewTests(World):
+    """The fourth review (2026-10-14): holds that failed, clocks ahead, two desks finishing one hold."""
+
+    def held_path(self, mid):
+        return os.path.join(self.folder.channel_dir("358", "held"), mid + ".json")
+
+    def on_hold(self):
+        return [n for n in self.messages("358") if n["from"] == "maintainer" and n["body"].startswith("On hold")]
+
+    def test_a_hold_whose_note_could_not_be_written_can_be_pressed_again_at_once(self):
+        m = self.seed("358", "reviewer", "358", "note fails", hexid="r4a001")
+        real_note = self.folder._note
+        calls = []
+        def failing_note(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                raise OSError(28, "No space left on device")
+            real_note(*args)
+        self.folder._note = failing_note
+        with self.assertRaises(OSError):
+            self.folder.hold("358", m["id"])
+        with open(self.held_path(m["id"])) as h:
+            self.assertIs(json.loads(h.read()).get("failed"), True)
+        self.assertTrue(self.folder.hold("358", m["id"]).startswith("⏸ On hold"))
+        self.assertEqual(len(self.on_hold()), 2)
+
+    def test_a_hold_claimed_at_a_time_in_the_future_never_blocks(self):
+        m = self.seed("358", "reviewer", "358", "clock ahead", hexid="r4a002")
+        core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": "2030-01-01T00:00:00.000Z", "told": []}) + "\n")
+        self.assertTrue(self.folder.hold("358", m["id"]).startswith("⏸ On hold"))
+        self.assertEqual(len(self.on_hold()), 2)
+
+    def test_finishing_an_old_unfinished_hold_twice_at_once_sends_each_note_once(self):
+        m = self.seed("358", "reviewer", "358", "finish me", hexid="r4a003")
+        core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": "2026-10-08T12:00:01.000Z", "told": []}) + "\n")
+        real_note = self.folder._note
+        def slow_note(*args):
+            time.sleep(0.05)
+            real_note(*args)
+        self.folder._note = slow_note
+        threads = [threading.Thread(target=self.folder.hold, args=("358", m["id"])) for _ in range(2)]
+        threads[0].start()
+        time.sleep(0.02)
+        threads[1].start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(self.on_hold()), 2)
+
+    def test_a_decline_racing_a_hold_never_leaves_the_agent_waiting(self):
+        m = self.seed("358", "reviewer", "358", "race me", hexid="r4a004")
+        real_note = self.folder._note
+        def slow_note(*args):
+            time.sleep(0.05)
+            real_note(*args)
+        self.folder._note = slow_note
+        hold = threading.Thread(target=self.folder.hold, args=("358", m["id"]))
+        decline = threading.Thread(target=self.folder.decline, args=("358", m["id"], "no"))
+        hold.start()
+        time.sleep(0.02)  # the decline lands while the hold's notes are being written
+        decline.start()
+        hold.join()
+        decline.join()
+        to_agent = [n["body"] for n in self.messages("358") if n["from"] == "maintainer" and n["to"] == "358"]
+        if any(b.startswith("On hold") for b in to_agent):
+            self.assertTrue(any(b.startswith("Declined") and "Nothing is coming" in b for b in to_agent), to_agent)
+
+    def test_finishing_a_hold_is_left_to_the_desk_that_claimed_it_last(self):
+        m = self.seed("358", "reviewer", "358", "claimed elsewhere", hexid="r4a005")
+        core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": "2026-10-08T12:00:01.000Z", "told": []}) + "\n")
+        def other_desk_claims(_seconds):
+            # while this desk waits after its claim, the pane claims the same hold
+            core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": core.iso_now(), "told": [], "claim": "0ther0"}) + "\n", replace=True)
+        with mock.patch.object(core.time, "sleep", side_effect=other_desk_claims):
+            self.assertIn("another desk", self.folder.hold("358", m["id"]))
+        self.assertEqual(self.on_hold(), [])
 
 
 class NoHardLinkTests(World):

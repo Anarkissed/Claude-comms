@@ -147,6 +147,16 @@ export const absolutize = (path: string, cwd: string, home: string, onWindows = 
  * Windows file systems ignore it by default, and a guard errs on the side of
  * denying), and with macOS's `/System/Volumes/Data` spelling of the same path folded.
  */
+/**
+ * A Windows path as Windows reads it: a name's trailing dots and spaces are dropped and a ":stream"
+ * suffix names the same file, so "agent-comms." and "agent-comms::$INDEX_ALLOCATION" are the folder.
+ */
+export const foldWindowsNames = (path: string): string =>
+  path
+    .split('/')
+    .map((c, i) => (i === 0 && /^[A-Za-z]:$/.test(c)) || /^\.{1,2}$/.test(c) ? c : c.replace(/:.*$/, '').replace(/[. ]+$/, ''))
+    .join('/')
+
 export const isInside = (path: string, root: string): boolean => {
   const fold = (s: string) => toSlashes(s).normalize('NFC').replace(/^\/System\/Volumes\/Data(?=\/)/i, '').toLowerCase()
   const p = fold(path)
@@ -183,32 +193,65 @@ const FIND_WRITES = /^-(delete|rm|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/
  * The command with quoted text blanked to spaces (same length): single-quoted text is literal in bash, zsh
  * and PowerShell; double-quoted text too, except `$(`…`)` and backquotes, which are kept so they still count.
  */
-const blankQuoted = (command: string): string => {
+const blankQuoted = (command: string): { text: string; open: boolean } => {
   let out = ''
-  let quote: '' | "'" | '"' = ''
+  let quote: '' | "'" | '"' | '$' = ''
   for (let i = 0; i < command.length; i += 1) {
     const ch = command[i] ?? ''
+    const next = command[i + 1] ?? ''
     if (quote === '') {
-      if (ch === "'" || ch === '"') quote = ch
-      out += ch
+      if (ch === '\\') {
+        // an escaped character is literal (a line continuation is nothing at all)
+        out += next === '\n' ? '  ' : `\\${next === '' ? '' : ' '}`
+        i += 1
+      } else if (ch === '#' && (i === 0 || /[\s;&|()<>]/.test(command[i - 1] ?? ''))) {
+        // a comment (a # that starts a word) runs to the end of the line
+        while (i < command.length && command[i] !== '\n') {
+          out += ' '
+          i += 1
+        }
+        if (i < command.length) out += '\n'
+      } else if (ch === '$' && next === "'") {
+        quote = '$'
+        out += "$'"
+        i += 1
+      } else {
+        if (ch === "'" || ch === '"') quote = ch
+        out += ch
+      }
+    } else if (quote === '$') {
+      // $'…': backslash escapes, ended by an unescaped '
+      if (ch === '\\') {
+        out += '  '
+        i += 1
+      } else if (ch === "'") {
+        quote = ''
+        out += ch
+      } else out += ' '
     } else if (ch === quote) {
       quote = ''
       out += ch
-    } else if (quote === '"' && (ch === '`' || (ch === '$' && command[i + 1] === '(') || (ch === '(' && command[i - 1] === '$'))) {
+    } else if (quote === '"' && ch === '\\') {
+      out += '  '
+      i += 1
+    } else if (quote === '"' && (ch === '`' || (ch === '$' && next === '(') || (ch === '(' && command[i - 1] === '$'))) {
       out += ch
     } else {
       out += ' '
     }
   }
 
-  return out
+  return { text: out, open: quote !== '' }
 }
 
 /** git options before the subcommand that change nothing about what runs. */
 const HARMLESS_GIT_GLOBALS = new Set(['--no-pager', '-P', '--no-optional-locks', '--literal-pathspecs', '--no-replace-objects'])
 
 export const isReadOnlyCommand = (command: string): boolean => {
-  const bare = blankQuoted(command)
+  const lexed = blankQuoted(command)
+  // a quote left open: the shell would not run this as written, and nothing after it can be judged
+  if (lexed.open) return false
+  const bare = lexed.text
   if (/[`()]|>(?!\s*&?\s*(1|2|\/dev\/null)\b)|\btee\b/.test(bare)) return false
   // split where the shell would, found on the quote-blanked text (a ; inside quotes is not a separator)
   const parts: string[] = []

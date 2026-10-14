@@ -27,6 +27,8 @@ SEEN_CAP = 1000
 _ACTION_LOCK = threading.Lock()
 # a hold record still missing recipients, claimed this recently, is being sent by another desk right now
 HOLD_IN_PROGRESS_S = 30
+# finishing someone's unfinished hold: claim it, wait this long, and go on only if the claim is still ours
+HOLD_CLAIM_SETTLE_S = 0.2
 
 
 def is_id(value: Any) -> bool:
@@ -300,6 +302,18 @@ class Folder:
         except (OSError, ValueError, AttributeError, TypeError):
             return None
 
+    def held_marks(self, ch: str, mid: str) -> Tuple[bool, Optional[str]]:
+        """A hold record's "failed" flag (its last note could not be written) and its "claim" token."""
+        try:
+            with open(os.path.join(self.channel_dir(ch, "held"), mid + ".json"), encoding="utf-8") as handle:
+                value = json.loads(handle.read())
+        except (OSError, ValueError, UnicodeDecodeError):
+            return False, None
+        if not isinstance(value, dict):
+            return False, None
+        claim = value.get("claim")
+        return value.get("failed") is True, claim if isinstance(claim, str) else None
+
     def held_records(self, ch: str) -> Dict[str, Optional[List[str]]]:
         """Messages on hold: channels/<ch>/held/<id>.json, written by this desk or the plugin's pane, each with
         who was told so far ("told"); None when the record does not say (an older one: everyone)."""
@@ -322,8 +336,13 @@ class Folder:
     def held_ids(self, ch: str) -> Set[str]:
         return set(self.held_records(ch))
 
-    def _write_held(self, ch: str, mid: str, ts: str, told: List[str], replace: bool) -> None:
-        write_atomic(self.channel_dir(ch, "held"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": ts, "told": told}) + "\n", replace=replace)
+    def _write_held(self, ch: str, mid: str, ts: str, told: List[str], replace: bool, failed: bool = False, claim: Optional[str] = None) -> None:
+        record: Dict[str, Any] = {"id": mid, "by": MAINTAINER, "ts": ts, "told": told}
+        if failed:
+            record["failed"] = True
+        if claim is not None:
+            record["claim"] = claim
+        write_atomic(self.channel_dir(ch, "held"), mid + ".json", dumps(record) + "\n", replace=replace)
 
     def migrate_legacy_held(self, cfg: Dict[str, Any]) -> None:
         """Holds kept only in this desk's state.json (before holds were files): written as files once, so the plugin sees them."""
@@ -486,8 +505,18 @@ class Folder:
             told = records.get(mid) or (recipients if records.get(mid) is None else [])
             claimed = self.held_claimed_at(ch, mid)
             unfinished = records.get(mid) is not None and any(r not in told for r in recipients)
-            if unfinished and claimed is not None and time.time() - claimed < HOLD_IN_PROGRESS_S:
+            failed, _ = self.held_marks(ch, mid)
+            # claimed in the last 30 s and not marked failed: another desk is sending it now (a time in the future never blocks)
+            if unfinished and not failed and claimed is not None and 0 <= time.time() - claimed < HOLD_IN_PROGRESS_S:
                 return "That hold is being sent from another desk right now; press Hold again in a moment if it does not finish."
+            if unfinished:
+                # finishing it: claim it afresh, so a desk reading it now sees a hold in progress, and go on
+                # only if the claim is still ours a moment later
+                claim = secrets.token_hex(6)
+                self._write_held(ch, mid, ts, told, replace=True, claim=claim)
+                time.sleep(HOLD_CLAIM_SETTLE_S)
+                if self.held_marks(ch, mid)[1] != claim:
+                    return "That hold is being finished from another desk right now."
         else:
             try:
                 self._write_held(ch, mid, ts, [], replace=False)
@@ -505,7 +534,15 @@ class Folder:
                 body = f"On hold: your {m['kind']} to {m['to']} (\"{first_line(m['body'])}\") is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon."
             else:
                 body = f"On hold: {with_article(m['kind'])} from {m['from']} to you is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon."
-            self._note(ch, r, body)
+            try:
+                self._note(ch, r, body)
+            except OSError:
+                # marked failed, so the next Hold (here or in the pane) finishes it at once
+                try:
+                    self._write_held(ch, mid, ts, told, replace=True, failed=True)
+                except OSError:
+                    pass
+                raise
             told = told + [r]
             self._write_held(ch, mid, ts, told, replace=True)
         return f"⏸ On hold: {m['from']} and {agent_side} were told to expect a message soon."

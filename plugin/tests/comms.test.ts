@@ -52,6 +52,8 @@ type World = {
   turns: number
   /** Texts a rewind took out of the conversation: rows holding any of them are gone from the api form. */
   cut: string[]
+  /** Tool results in the conversation (comms_read's), as tool_result blocks of the api form. */
+  results: string[]
 }
 
 const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/'
@@ -75,6 +77,8 @@ type WorldOptions = {
   storeRefuses?: (key: string) => boolean
   /** Paths whose first $.fs.read throws (a busy file). */
   readFailsOnce?: string[]
+  /** The first $.fs.write to a path it matches throws (a full disk, a locked folder). */
+  writeFailsOnce?: (path: string) => boolean
 }
 
 const world = (on: On, options: WorldOptions = {}): World => {
@@ -122,6 +126,7 @@ const world = (on: On, options: WorldOptions = {}): World => {
     messages: [...(options.messages ?? [])],
     turns: 0,
     cut: [],
+    results: [],
   }
   let statusText: string | undefined
   w.keeps = keeps
@@ -166,6 +171,7 @@ const world = (on: On, options: WorldOptions = {}): World => {
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
     return { value: text }
   })
+  let writeFailed = false
   on('fs.write', ($, e) => {
     if (e.path.endsWith('/.keep')) {
       keeps.add(real(e.path))
@@ -173,6 +179,10 @@ const world = (on: On, options: WorldOptions = {}): World => {
       return { value: undefined }
     }
     const p = real(e.path)
+    if (options.writeFailsOnce?.(p) && !writeFailed) {
+      writeFailed = true
+      throw new Error(`ENOSPC: no space left on device, open '${e.path}'`)
+    }
     w.writes.push(p)
     put(p, e.text)
     const names = listDir(dirOf(p)).filter(x => x.kind === 'file' && isCandidateFile(x.name)).map(x => x.name)
@@ -252,8 +262,10 @@ const world = (on: On, options: WorldOptions = {}): World => {
   on('session.messages', ($, e) => {
     const asApi = (e as { as?: string } | undefined)?.as === 'api'
     if (!asApi) return { value: w.messages.map(text => ({ role: 'user', text, toolUses: [] })) }
-    const rows = [...w.messages, ...w.appended].filter(text => !w.cut.some(part => text.includes(part)))
-    return { value: rows.map(text => ({ role: 'user', content: [{ type: 'text', text }] })) }
+    const kept = (text: string) => !w.cut.some(part => text.includes(part))
+    const rows = [...w.messages, ...w.appended].filter(kept).map(text => ({ role: 'user', content: [{ type: 'text', text }] }))
+    const results = w.results.filter(kept).map((text, i) => ({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${i}`, content: [{ type: 'text', text }] }] }))
+    return { value: [...rows, ...results] }
   })
   on('session.turns', () => ({ value: w.turns }))
   on('session.cwd', () => ({ value: options.windows ? 'C:\\work' : CWD }))
@@ -452,6 +464,7 @@ describe('3. approval gate', () => {
     expect(String(read.result)).toContain('ok to merge')
     expect(String(read.result)).toContain(maint.body)
     expect(w.status()).toBe('comms #358: 0 new')
+    w.results.push(String(read.result)) // the tool's result is a row of the conversation now
     await turn($, 1)
     expect(w.appended).toHaveLength(0) // read through the tool: not delivered again
   })
@@ -2044,7 +2057,7 @@ describe('second review fixes (2026-10-14)', () => {
       'cat a & rm -rf b', 'cat <(rm x)', 'echo (rm x)', 'sort -o out in', 'sort -uo f f', 'sort --output=f f', 'uniq in out', 'tree -o f',
       'rg --pre ./x pattern', 'GIT_EXTERNAL_DIFF=./x git diff a b', 'git -c core.pager=x log', 'git diff --output=f', 'git grep --open-files-in-pager=x y',
       'find . -fprint0 x', "find . '-delete'", 'find . -ex\\ec rm {} ;', 'cat a |& tee b', 'xxd in out', 'plutil -remove k f',
-    ]) expect(isReadOnlyCommand(bad)).toBe(false)
+    ]) expect([bad, isReadOnlyCommand(bad)]).toEqual([bad, false])
     for (const ok of ['LC_ALL=C sort f', 'sort -r f', 'rg pattern dir', 'git status', 'cat a 2>&1 | head', 'find . -name "*.json" -print']) expect(isReadOnlyCommand(ok)).toBe(true)
   })
 
@@ -2457,5 +2470,163 @@ describe('third review fixes (2026-10-14)', () => {
     // 100 wide characters take 200 cells: three pieces of at most 98 cells each, per line
     expect(await ui.find({ type: 'Text', text: /of 300 ·/ })).toBeDefined()
     await ui.unmount()
+  })
+})
+
+describe('fourth review fixes (2026-10-14)', () => {
+  const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
+    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+  const FOLDER = ROOT.slice(ROOT.lastIndexOf('/') + 1)
+  const DENIED = 'written only through'
+  const filesIn = (w: World, ch: string) =>
+    [...w.files.entries()]
+      .filter(([p]) => p.startsWith(`${msgDir(ch)}/`))
+      .flatMap(([p, text]) => {
+        const r = parse(text, nameOf(p).slice(0, -5))
+        return r.ok ? [r.message] : []
+      })
+  const onHold = (w: World) => filesIn(w, '358').filter(n => n.body.startsWith('On hold'))
+
+  test('a capped delivered list trims again later: what lies below its floor is never counted as owed', async ($, on) => {
+    const w = world(on, { identity: '358' })
+    const old = Array.from({ length: 3001 }, (_, i) =>
+      seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: `old ${i}`, at: Date.UTC(2026, 8, 1) + i * 1000, hex: `d${i.toString(16).padStart(5, '0')}` }).id)
+    w.store.set('delivered:S1:358', old)
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'first new', at: T0 - 5000, hex: 'e00000' })
+    await start($)
+    await turn($, 1)
+    expect((w.store.get('delivered:S1:358') as string[]).length).toBeLessThanOrEqual(2000)
+    for (let i = 1; i <= 1001; i += 1) seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: `next ${i}`, at: T0 - 4000 + i, hex: `e${i.toString(16).padStart(5, '0')}` })
+    await turn($, 2)
+    expect((w.store.get('delivered:S1:358') as string[]).length).toBeLessThanOrEqual(2000)
+  })
+
+  test('a delivery missing from the START of the conversation is not sent again: a rewind cuts only its end', async ($, on) => {
+    const a = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'long ago', nowMs: T0 - 9000, hex: 'e10001' })
+    const b = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'lately', nowMs: T0 - 8000, hex: 'e10002' })
+    const w = world(on, {
+      identity: '358',
+      messages: [`[agent-comms] Message … (id ${b.id}) lately`],
+      store: { 'delivered:S1:358': [a.id, b.id], 'recent:S1': [{ ch: '358', id: a.id }, { ch: '358', id: b.id }] },
+    })
+    put(w, `${msgDir('358')}/${a.id}.json`, format(a))
+    put(w, `${msgDir('358')}/${b.id}.json`, format(b))
+    await start($)
+    await turn($, 1)
+    expect(w.appended.filter(t => t.includes('long ago') || t.includes('lately'))).toHaveLength(0)
+  })
+
+  test('a message read with comms_read and then rewound away is delivered again', async ($, on) => {
+    const w = world(on, { identity: '358' })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'read by the tool', at: T0 - 1000, hex: 'e20001' })
+    await start($)
+    const read = await $.tool.call({ tool: 'mcp__agent-comms__comms_read', channel: '358' })
+    expect(String(read.result)).toContain('read by the tool')
+    w.results.push(String(read.result))
+    await turn($, 1)
+    expect(w.appended.filter(t => t.includes('read by the tool'))).toHaveLength(0)
+    w.cut = ['read by the tool']
+    await turn($, 2)
+    expect(w.appended.filter(t => t.includes('read by the tool'))).toHaveLength(1)
+  })
+
+  test('a tag sequence that is not one of the three subdivision flags is shown and counted', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'flag 🏴\u{E0061}\u{E0062}\u{E007F} end', at: T0 - 1000, hex: 'e30001' })
+    await start($)
+    const ui = await mount($)
+    expect(await ui.find({ type: 'Text', text: /⟨U\+E0061⟩/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /3 invisible characters/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('the flags of England, Scotland and Wales are not flagged as invisible characters', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const flag = (tags: string) => `🏴${[...tags].map(c => String.fromCodePoint(0xe0000 + c.charCodeAt(0))).join('')}\u{E007F}`
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: `${flag('gbeng')} ${flag('gbsct')} ${flag('gbwls')}`, at: T0 - 1000, hex: 'e30002' })
+    await start($)
+    const ui = await mount($)
+    expect(await ui.find({ type: 'Text', text: /invisible character/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('guard: quotes are read as the shell reads them (escapes, $\'…\', comments, a quote left open)', () => {
+    for (const bad of [
+      "grep \\' f; rm y", // an escaped quote opens nothing
+      'grep "x\\"" f; rm y', // an escaped " inside double quotes does not end them
+      "grep $'\\'' f; rm y", // in $'…', \' is a quote character
+      "grep x f #'\nrm y", // a quote inside a comment opens nothing
+      "grep x f;#'\nrm y",
+      "grep 'x f; rm y", // a quote left open
+    ]) expect([bad, isReadOnlyCommand(bad)]).toEqual([bad, false])
+    for (const ok of ["grep 'it'\\''s' f", 'grep x \\\n  f', 'grep "a\\"b" f', "grep x f # it's fine", 'grep \\; f']) expect([ok, isReadOnlyCommand(ok)]).toEqual([ok, true])
+  })
+
+  test('a hold whose note could not be written can be pressed again at once', async ($, on) => {
+    const w = world(on, { identity: 'maintainer', writeFailsOnce: p => p.includes('/channels/358/messages/') })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'note fails', at: T0 - 1000, hex: 'e50001' })
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `hold:${m.id}` })
+    expect(onHold(w)).toHaveLength(0)
+    expect(await ui.find({ type: 'Text', text: /Hold note not written/ })).toBeDefined()
+    await ui.press({ key: `hold:${m.id}` })
+    expect(onHold(w)).toHaveLength(2)
+    await ui.unmount()
+  })
+
+  test('a hold claimed at a time in the future (a clock ahead) never blocks the next Hold', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'clock ahead', at: T0 - 1000, hex: 'e50002' })
+    put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T12:10:00.000Z","told":[]}\n`)
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `hold:${m.id}` })
+    expect(onHold(w)).toHaveLength(2)
+    await ui.unmount()
+  })
+
+  test('a line of combining marks is still cut into pieces, so a page stays within its size', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const body = Array.from({ length: 12 }, () => `e${'\u0301'.repeat(5000)}`).join('\n')
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body, at: T0 - 1000, hex: 'e60001' })
+    await start($)
+    const ui = await mount($)
+    // 5001 characters a line: three pieces of at most 2000
+    expect(await ui.find({ type: 'Text', text: /of 36 ·/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('an emoji drawn wide (pictograph + VS16) takes two cells', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: Array.from({ length: 100 }, () => '⚠️'.repeat(100)).join('\n'), at: T0 - 1000, hex: 'e70001' })
+    await start($)
+    const ui = await mount($)
+    // 100 ⚠️ take 200 cells: three pieces a line
+    expect(await ui.find({ type: 'Text', text: /of 300 ·/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a family emoji is one character two cells wide, never split', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: Array.from({ length: 100 }, () => '👨‍👩‍👧'.repeat(40)).join('\n'), at: T0 - 1000, hex: 'e70002' })
+    await start($)
+    const ui = await mount($)
+    // 40 families take 80 cells: one piece a line
+    expect(await ui.find({ type: 'Text', text: /of 100 ·/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('Windows reads a trailing dot or space, or a ":stream", as the same folder: refused', async ($, on) => {
+    world(on, { identity: '358', windows: true })
+    await start($)
+    for (const p of [
+      `\\\\nas\\share\\${FOLDER}.\\x.json`,
+      `\\\\nas\\share\\${FOLDER} \\x.json`,
+      `\\\\nas\\share\\${FOLDER}::$INDEX_ALLOCATION\\x.json`,
+      'C:\\Users\\me\\agent-comms.\\channels\\358\\approvals\\x.json',
+      'C:\\Users\\me\\agent-comms  \\channels\\358\\approvals\\x.json',
+    ]) expect(denial(await $.tool.call({ tool: 'Write', file_path: p, content: 'x' }))).toContain(DENIED)
+    expect(denial(await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\me\\agent-comms-web\\x.txt', content: 'x' }))).toBeUndefined()
   })
 })

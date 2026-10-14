@@ -90,7 +90,8 @@ For a reviewer that writes files itself, such as a Chat agent with file access:
   channels/<channel>/messages/<UTC ISO time with ":" as "-">-<from>-<6 hex>.json
   channels/<channel>/approvals/<message id>.json     {"id", "by": "maintainer", "ts"}
   channels/<channel>/declined/<message id>.json      {"id", "by": "maintainer", "ts", "reason"}
-  channels/<channel>/held/<message id>.json          {"id", "by": "maintainer", "ts"}   (on hold; shared by the pane and the web desk)
+  channels/<channel>/held/<message id>.json          {"id", "by": "maintainer", "ts", "told"}   (on hold; shared by the pane and the web desk;
+                                                      "told" lists who has been told so far, "failed": true marks a note that could not be written)
 ```
 
 ```json
@@ -120,7 +121,7 @@ For a reviewer that writes files itself, such as a Chat agent with file access:
 
 ## Development
 
-- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (160 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
-- **Web:** `cd web && python3 -m unittest -v test_web` (50 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
+- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (172 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
+- **Web:** `cd web && python3 -m unittest -v test_web` (55 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
 
 Forks and pull requests are welcome. Released under the [MIT License](LICENSE).

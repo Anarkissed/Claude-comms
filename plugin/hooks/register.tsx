@@ -27,6 +27,7 @@ import {
   isReservedId,
   clip,
   wellFormed,
+  randomHex,
   knownIds,
   mergeConfig,
   newMessage,
@@ -50,6 +51,7 @@ import {
   commandMentionsRoot,
   denyText,
   isInside,
+  foldWindowsNames,
   isPathKey,
   isReadOnlyCommand,
   DIR_KEY_PATTERN,
@@ -326,10 +328,26 @@ const recheckDeliveries = async ($: Engine) => {
   // plain form of $.session.messages() leaves out (a /clear and a compaction empty the list themselves)
   const rows = await $.session.messages({ as: 'api' }).catch(() => undefined)
   if (rows === undefined || rows.length >= 4096) return
-  const text = rows
-    .flatMap(row => (Array.isArray(row.content) ? row.content : []).flatMap(block => (block.type === 'text' && typeof block.text === 'string' ? [block.text] : [])))
-    .join('\n')
-  const lost = list.filter(r => !text.includes(`(id ${r.id})`))
+  // the text of every text block and every tool result (comms_read hands messages over as one)
+  const textOf = (block: unknown): string[] => {
+    if (typeof block !== 'object' || block === null) return []
+    const b = block as { type?: unknown; text?: unknown; content?: unknown }
+    if (b.type === 'text' && typeof b.text === 'string') return [b.text]
+    if (b.type === 'tool_result') return typeof b.content === 'string' ? [b.content] : Array.isArray(b.content) ? b.content.flatMap(textOf) : []
+    return []
+  }
+  const text = rows.flatMap(row => (Array.isArray(row.content) ? row.content : []).flatMap(textOf)).join('\n')
+  // A rewind removes the END of the conversation, so only deliveries after the last one still found are
+  // lost. (The api form keeps the newest 4096 rows of a longer conversation: its START may be missing.)
+  let lastFound = -1
+  list.forEach((r, i) => {
+    if (text.includes(`(id ${r.id})`)) lastFound = i
+  })
+  if (lastFound < 0) {
+    const plain = await $.session.messages().catch(() => undefined)
+    if (plain === undefined || plain.length >= 4096) return
+  }
+  const lost = list.slice(lastFound + 1)
   if (lost.length === 0) return
   for (const ch of new Set(lost.map(r => r.ch))) {
     const gone = new Set(lost.filter(r => r.ch === ch).map(r => r.id))
@@ -816,14 +834,15 @@ const markDelivered = async ($: Engine, ch: string, ids: readonly string[]) => {
     // passes a message still owed to this session (one waiting for approval, a hand-written id out of order)
     if (list.length > DELIVERED_CAP) {
       list.sort((a, b) => a.localeCompare(b))
-      const owed = oldestOwed.get(ch)
+      const was = await $.store.get(floorKey(ch))
+      const owedNow = oldestOwed.get(ch)
+      const owed = owedNow !== undefined && typeof was === 'string' && owedNow.localeCompare(was) <= 0 ? undefined : owedNow
       const droppable = list.length - DELIVERED_KEEP
       let cut = 0
       while (cut < droppable && (owed === undefined || (list[cut] ?? '').localeCompare(owed) < 0)) cut += 1
       const dropped = list.slice(0, cut)
       list = list.slice(cut)
       const floor = dropped.at(-1)
-      const was = await $.store.get(floorKey(ch))
       if (floor !== undefined && (typeof was !== 'string' || floor.localeCompare(was) > 0)) await $.store.set(floorKey(ch), floor)
     }
     await $.store.set(key, list)
@@ -871,9 +890,9 @@ const scanAsAgent = async ($: Engine, cfgIn: Config, self: string, gen: number) 
     )
     next.set(channel.id, fresh)
     // the oldest message still owed here, whatever its approval state: a capped delivered list keeps it
-    const exact = new Set([...asList(await $.store.get(deliveredKey(channel.id)).catch(() => undefined)), ...(sentNow.get(deliveredKey(channel.id)) ?? [])])
+    // (judged with the floor: an id at or below it counts as delivered, so it is never owed)
     const owed = scanned.messages
-      .filter(m => (m.to === self || (m.to === ALL && isGroup(channel))) && m.from !== self && !scanned.declined.has(m.id) && !exact.has(m.id))
+      .filter(m => (m.to === self || (m.to === ALL && isGroup(channel))) && m.from !== self && !scanned.declined.has(m.id) && !delivered.has(m.id))
       .map(m => m.id)
       .sort((a, b) => a.localeCompare(b))[0]
     if (owed === undefined) oldestOwed.delete(channel.id)
@@ -1153,10 +1172,7 @@ const deliver = async ($: Engine): Promise<Map<string, Message[]>> => {
       if (done.length > 0) sent.set(ch, done)
       unread.set(ch, list.filter(m => !done.includes(m)))
     }
-    await quietly($, async () => {
-      const added = [...sent].flatMap(([ch, list]) => list.map(m => ({ ch, id: m.id })))
-      if (added.length > 0) await $.store.set(recentKey(), [...((await $.store.get(recentKey())) as unknown[] | undefined ?? []), ...added].slice(-100))
-    })
+    await rememberRecent($, [...sent].flatMap(([ch, list]) => list.map(m => ({ ch, id: m.id }))))
     if (config && me) $.ui.status(agentStatus(channelsFor(config, me)))
 
     return sent
@@ -1170,6 +1186,15 @@ const deliver = async ($: Engine): Promise<Map<string, Message[]>> => {
     })
 
   return delivering
+}
+
+/** Adds deliveries to the list a rewind check goes through (the last 100, in delivery order). */
+const rememberRecent = async ($: Engine, added: readonly { ch: string; id: string }[]) => {
+  if (added.length === 0) return
+  await quietly($, async () => {
+    const was = await $.store.get(recentKey())
+    await $.store.set(recentKey(), [...(Array.isArray(was) ? was : []), ...added].slice(-100))
+  })
 }
 
 /** One delivered message, added to this session's conversation. */
@@ -1203,7 +1228,8 @@ const guard = async ($: Engine, e: ToolCallInput): Promise<string | undefined> =
     const bases = [cwd, ...stringsUnder(input, key => DIR_KEY_PATTERN.test(key)).map(d => absolutize(d, cwd, home, windows))]
     for (const raw of pathStrings) {
       for (const at of new Set(bases)) {
-        const abs = absolutize(raw, at, home, windows)
+        const spelled = absolutize(raw, at, home, windows)
+        const abs = windows ? foldWindowsNames(spelled) : spelled
         if (roots.some(r => isInside(abs, r))) return denyText(root)
         // spellings no file system call can place (macOS /.vol/<dev>/<inode>, a network path that names
         // the folder) are denied rather than placed somewhere else
@@ -1288,6 +1314,7 @@ const serveRead = async ($: Engine, input: Record<string, unknown>): Promise<Too
     const list = unread.get(channel.id) ?? []
     for (const m of list) out.push(deliveryText(channel.id, m, isGated(m) && (approvedNow.get(channel.id)?.has(m.id) ?? false)))
     await markDelivered($, channel.id, list.map(m => m.id))
+    await rememberRecent($, list.map(m => ({ ch: channel.id, id: m.id })))
     unread.set(channel.id, [])
   }
   $.ui.status(agentStatus(mine))
@@ -1397,7 +1424,19 @@ const heldTime = async ($: Engine, ch: string, id: string): Promise<number | und
 }
 
 /** A hold's record, channels/<ch>/held/<id>.json: who has been told so far ("all" for a group). */
-const formatHeld = (id: string, ts: string, told: readonly string[]): string => `${JSON.stringify({ id, by: MAINTAINER, ts, told })}\n`
+const formatHeld = (id: string, ts: string, told: readonly string[], failed = false, claim?: string): string =>
+  `${JSON.stringify({ id, by: MAINTAINER, ts, told, ...(failed ? { failed: true } : {}), ...(claim !== undefined ? { claim } : {}) })}\n`
+
+/** A hold record's "failed" flag (its last note could not be written) and "claim" token. */
+const heldMarks = async ($: Engine, ch: string, id: string): Promise<{ failed: boolean; claim?: string }> => {
+  const text = await $.fs.read(`${paths.held(ch)}/${id}.json`).catch(() => undefined)
+  try {
+    const value = (typeof text === 'string' ? JSON.parse(text) : {}) as { failed?: unknown; claim?: unknown }
+    return { failed: value.failed === true, ...(typeof value.claim === 'string' ? { claim: value.claim } : {}) }
+  } catch {
+    return { failed: false }
+  }
+}
 
 const readHeld = async ($: Engine): Promise<Set<string>> => {
   const value = await $.store.get(heldKey())
@@ -1453,13 +1492,35 @@ const revealInvisible = (text: string): { text: string; count: number } => {
   // emoji sequences stay whole (their variation selectors, ZWJ and tag characters are what draws them);
   // every other format, private-use, variation-selector, tag or control character is shown and counted
   // eslint-disable-next-line no-control-regex
-  const shown = wellFormed(text).replace(/\r\n?/g, '\n').replace(/(\u{1F3F4}[\u{E0061}-\u{E007A}]+\u{E007F}|[#*0-9]\u{FE0F}?\u{20E3}|\p{Regional_Indicator}{2}|\p{Extended_Pictographic}[\u{FE0E}\u{FE0F}]?\p{Emoji_Modifier}?(?:\u{200D}\p{Extended_Pictographic}[\u{FE0E}\u{FE0F}]?\p{Emoji_Modifier}?)*)|[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}\p{Co}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]/gu, (whole, emoji: string | undefined) => {
+  const shown = wellFormed(text).replace(/\r\n?/g, '\n').replace(/(\u{1F3F4}\u{E0067}\u{E0062}(?:\u{E0065}\u{E006E}\u{E0067}|\u{E0073}\u{E0063}\u{E0074}|\u{E0077}\u{E006C}\u{E0073})\u{E007F}|[#*0-9]\u{FE0F}?\u{20E3}|\p{Regional_Indicator}{2}|\p{Extended_Pictographic}[\u{FE0E}\u{FE0F}]?\p{Emoji_Modifier}?(?:\u{200D}\p{Extended_Pictographic}[\u{FE0E}\u{FE0F}]?\p{Emoji_Modifier}?)*)|[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}\p{Co}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]/gu, (whole, emoji: string | undefined) => {
     if (emoji !== undefined) return whole
     count += 1
     return `⟨U+${(whole.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}⟩`
   })
 
   return { text: shown, count }
+}
+
+/** The longest piece of a wrapped line, in UTF-16 units: a line of zero-width characters is still cut. */
+const MAX_PIECE = 2000
+
+/**
+ * A line's grapheme clusters (what a terminal draws as one character), or its code points where
+ * Intl.Segmenter is missing. A cluster longer than any real one (a pile of combining marks) is taken
+ * apart into its code points, so a piece of a wrapped line stays short.
+ */
+const graphemes = (line: string): string[] => {
+  const Segmenter = (Intl as unknown as { Segmenter?: new (l?: string, o?: { granularity: string }) => { segment: (s: string) => Iterable<{ segment: string }> } }).Segmenter
+  if (Segmenter === undefined) return Array.from(line)
+  return Array.from(new Segmenter(undefined, { granularity: 'grapheme' }).segment(line), s => s.segment).flatMap(c => (c.length > 64 ? Array.from(c) : [c]))
+}
+
+/** Terminal cells a grapheme cluster takes: an emoji (presentation, or pictograph + VS16) 2, else the sum of its characters. */
+const clusterCells = (cluster: string): number => {
+  if (/\p{Emoji_Presentation}/u.test(cluster) || (/\p{Extended_Pictographic}/u.test(cluster) && cluster.includes('\uFE0F'))) return 2
+  let cells = 0
+  for (const ch of cluster) cells += cellsOf(ch)
+  return cells
 }
 
 /** Terminal cells a character takes: 0 for combining marks and joiners, 2 for wide (East Asian, emoji), 1 otherwise. */
@@ -1539,11 +1600,24 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
   if (scanned.held.has(id) || legacy.has(id)) {
     const recorded = scanned.held.get(id)
     told = recorded ?? recipients
-    // a record still missing recipients, written in the last 30 s, is a hold another desk is sending now
+    // a record still missing recipients, claimed in the last 30 s and not marked failed, is a hold another
+    // desk is sending now (a time in the future is not "now": it never blocks)
+    const unfinished = recorded !== undefined && recipients.some(r => !recorded.includes(r))
     const at = await heldTime($, ch, id)
-    if (recorded !== undefined && recipients.some(r => !recorded.includes(r)) && at !== undefined && (await $.clock.now()) - at < 30_000) {
+    const age = at === undefined ? undefined : (await $.clock.now()) - at
+    const marks = await heldMarks($, ch, id)
+    if (unfinished && !marks.failed && age !== undefined && age >= 0 && age < 30_000) {
       await update($, infoAtom, () => 'That hold is being sent from another desk right now; press Hold again in a moment if it does not finish.')
       return
+    }
+    if (unfinished) {
+      // finishing it: claim it afresh first, so another desk reading it now sees a hold in progress
+      const claim = randomHex(6)
+      await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, told, false, claim), true)
+      if ((await heldMarks($, ch, id)).claim !== claim) {
+        await update($, infoAtom, () => 'That hold is being finished from another desk right now.')
+        return
+      }
     }
   } else {
     const claim = await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, []))
@@ -1570,6 +1644,8 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
     const written = await postNote($, ch, r, noteFor(r))
     if (!written.ok) {
       failed = written.reason
+      // marked failed, so the next Hold (on this desk or the other) finishes it at once
+      await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, told, true), true)
       break
     }
     told = [...told, r]
@@ -2354,9 +2430,9 @@ export const register: Register = (on, options) => {
         const out: string[] = []
         let piece = ''
         let cells = 0
-        for (const ch of Array.from(line.replace(/\t/g, '        '))) {
-          const w = cellsOf(ch)
-          if (cells + w > width && piece !== '') {
+        for (const ch of graphemes(line.replace(/\t/g, '        '))) {
+          const w = clusterCells(ch)
+          if ((cells + w > width || piece.length + ch.length > MAX_PIECE) && piece !== '') {
             out.push(piece)
             piece = ''
             cells = 0
