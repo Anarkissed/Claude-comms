@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 
 import comms_core as core
@@ -486,9 +487,16 @@ class AuditFixTests(World):
 
     def test_two_holds_at_once_send_one_set_of_notes(self):
         m = self.seed("358", "reviewer", "358", "double press", hexid="aud014")
+        # slow notes widen the window between the claim and the last note, where a second press lands
+        real_note = self.folder._note
+        def slow_note(*args):
+            time.sleep(0.05)
+            real_note(*args)
+        self.folder._note = slow_note
         threads = [threading.Thread(target=self.folder.hold, args=("358", m["id"])) for _ in range(2)]
-        for t in threads:
-            t.start()
+        threads[0].start()
+        time.sleep(0.02)  # the second press lands after the first claimed the hold, while its notes are being written
+        threads[1].start()
         for t in threads:
             t.join()
         self.assertEqual(len([n for n in self.messages("358") if n["body"].startswith("On hold")]), 2)
