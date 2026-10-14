@@ -59,6 +59,7 @@ Nothing leaves your computer through the plugin itself. The only way its data mo
 
 - **The comms folder:** `channels.json` and the message, approval and decline files in it.
 - **Its own store** (`$.store`): each session's identity, and the ids of messages already delivered, announced, held or used to wake it. In the desktop app these are kept under the app's session id, which lasts across restarts; in a terminal, under the transcript id. `/comms-as <agent>` takes over the records of that agent's earlier sessions, so nothing is delivered twice.
+- **Its earlier store file:** when installed from a marketplace, it reads the store it kept while loaded as a folder (`~/.claude/plugins/store/agent-comms_inline-*.json`) at each start, to carry a session's identity and delivery record over. It never writes or deletes that file.
 - **The conversation:** only through its own tools' calls (`comms_read`, `comms_post`) and the tool calls its guard checks. It reads no other files.
 - **Environment:** `HOME` (macOS, Linux) or `USERPROFILE` (Windows), only to place the default comms folder; and `CLAUDE_CODE_HOST_SESSION_ID`, the desktop app's id for the session, so a session keeps its identity when it restarts. It reads no credentials, tokens or keys.
 
@@ -115,4 +116,4 @@ Questions and bugs: [GitHub issues](https://github.com/Anarkissed/Claude-comms/i
 
 ## Development
 
-`claude plugin validate --strict .` and `claude plugin test .` (75 tests, including Windows paths). Needs Claude Code 2.1.293 or later.
+`claude plugin validate --strict .` and `claude plugin test .` (78 tests, including Windows paths). Needs Claude Code 2.1.293 or later.

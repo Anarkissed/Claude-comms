@@ -178,9 +178,64 @@ const init = async ($: Engine) => {
   root = absolutize(folderOption !== '' ? folderOption : `${home}/agent-comms`, home || '/', home)
   const host = await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')
   hostId = host !== undefined && host !== '' ? host : undefined
+  await importFolderLoadedStore($)
   let stored = await $.store.get(identityKey())
   if (stored === undefined && hostId !== undefined && sessionId !== undefined) stored = await adoptTranscriptRecords($, sessionId)
   me = typeof stored === 'string' && isId(stored) ? stored : undefined
+}
+
+/** The store files the plugin kept while loaded as a folder (`agent-comms_inline-*.json`), parsed. */
+const readFolderLoadedStores = async ($: Engine): Promise<Record<string, unknown>[]> => {
+  if (home === '') return []
+  const dir = `${home}/.claude/plugins/store`
+  const listed = await $.fs.list(dir).catch(() => [])
+  const out: Record<string, unknown>[] = []
+  for (const file of listed) {
+    if (file.kind !== 'file' || !file.name.startsWith('agent-comms_inline') || !file.name.endsWith('.json')) continue
+    const text = await $.fs.read(`${dir}/${file.name}`).catch(() => undefined)
+    try {
+      const data: unknown = typeof text === 'string' ? JSON.parse(text) : undefined
+      if (typeof data === 'object' && data !== null && !Array.isArray(data)) out.push(data as Record<string, unknown>)
+    } catch {
+      // a file being rewritten: the next start reads it
+    }
+  }
+
+  return out
+}
+
+/**
+ * The plugin installed from a marketplace has its own store file, apart from the
+ * one it used when loaded as a folder (CLAUDE_CODE_PLUGIN_DIRS, `@inline`). At
+ * each start this session takes its own records from that older file, so
+ * sessions can move over one at a time without losing who they are or being
+ * sent old messages again:
+ * - delivered / announced / woken lists are merged every time (they only grow);
+ * - an identity, the maintainer's held list and its last-seen marks are taken
+ *   once (marked `imported:<owner>`), so a later `/comms-as off` or a released
+ *   hold is never undone by the old file.
+ * Loaded as a folder itself, it reads its own records back: nothing changes.
+ */
+const importFolderLoadedStore = async ($: Engine) => {
+  const stores = await readFolderLoadedStores($)
+  if (stores.length === 0) return
+  const marker = `imported:${owner()}`
+  const isFirst = (await $.store.get(marker)) !== true
+  const ids = [...new Set([owner(), sessionId].filter((v): v is string => v !== undefined))]
+  const asList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
+  for (const data of stores) {
+    for (const [key, value] of Object.entries(data)) {
+      const isMyList = ids.some(id => key.startsWith(`delivered:${id}:`) || key === `notified:${id}` || key === `woken:${id}`)
+      if (isMyList) {
+        const merged = new Set([...asList(await $.store.get(key)), ...asList(value)])
+        await $.store.set(key, [...merged])
+        continue
+      }
+      const isOnce = ids.some(id => key === `identity:${id}`) || key === heldKey() || key.startsWith('seen:maintainer:')
+      if (isOnce && isFirst && (await $.store.get(key)) === undefined) await $.store.set(key, value)
+    }
+  }
+  if (isFirst) await $.store.set(marker, true)
 }
 
 /**
@@ -219,6 +274,20 @@ const takeRecordsOf = async ($: Engine, earlier: string) => {
  * keeps its own semantics: a new reviewer chat receives what it hasn't seen.
  */
 const takeOverAgent = async ($: Engine, id: string) => {
+  // earlier sessions recorded by the folder-loaded copy of the plugin
+  const asList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
+  for (const data of await readFolderLoadedStores($)) {
+    for (const [key, value] of Object.entries(data)) {
+      if (!key.startsWith('identity:') || value !== id || key === identityKey()) continue
+      const earlier = key.slice('identity:'.length)
+      for (const [k, v] of Object.entries(data)) {
+        const isTheirs = k.startsWith(`delivered:${earlier}:`) || k === `notified:${earlier}` || k === `woken:${earlier}`
+        if (!isTheirs) continue
+        const target = k.replace(earlier, owner())
+        await $.store.set(target, [...new Set([...asList(await $.store.get(target)), ...asList(v)])])
+      }
+    }
+  }
   for (const key of await $.store.keys()) {
     if (!key.startsWith('identity:') || key === identityKey()) continue
     if ((await $.store.get(key)) !== id) continue

@@ -15,6 +15,8 @@ const WIN_ROOT = 'C:/Users/me/agent-comms'
 const HOME = '/w' // so the default folder, HOME/agent-comms, is ROOT
 const ROOT = '/w/agent-comms'
 const CWD = '/w/proj'
+/** Where the folder-loaded copy of the plugin kept its store. */
+const OLD_STORE = `${HOME}/.claude/plugins/store/agent-comms_inline-f1bc9a6088a1.json`
 const SID = 'S1'
 const T0 = Date.UTC(2026, 9, 3, 12, 0, 0, 0)
 
@@ -506,6 +508,40 @@ describe('5. tool.call guard', () => {
     expect(w.store.get('delivered:local_B:358')).toContain(m.id)
   })
 
+  test('installed from a marketplace, a session takes its records from the folder-loaded store: same identity, nothing sent twice', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'delivered by the folder-loaded copy', nowMs: T0 - 5000, hex: 'imp001' })
+    const w = world(on, { host: 'local_A' })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    put(w, OLD_STORE, JSON.stringify({ 'identity:local_A': '358', 'delivered:local_A:358': [m.id], 'identity:local_Z': '361', 'held:maintainer': ['x'] }))
+    await start($)
+    await turn($, 1)
+    expect(w.tools).toContain('comms_post')
+    expect(w.appended.some(t => t.includes('delivered by the folder-loaded copy'))).toBe(false)
+    // another session's identity stays in the old file until that session moves over
+    expect(w.store.has('identity:local_Z')).toBe(false)
+  })
+
+  test('the store import never brings back an identity the session gave up', async ($, on) => {
+    const w = world(on, { host: 'local_A', store: { 'imported:local_A': true } })
+    put(w, OLD_STORE, JSON.stringify({ 'identity:local_A': '358' }))
+    await start($)
+    await turn($, 1)
+    expect(w.tools).not.toContain('comms_post')
+    expect(w.store.has('identity:local_A')).toBe(false)
+  })
+
+  test('/comms-as <agent> also takes over an earlier session recorded only in the folder-loaded store (the #362 case)', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'seen long ago', nowMs: T0 - 5000, hex: 'imp002' })
+    const w = world(on, { host: 'local_A', sid: 'S9' })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    put(w, OLD_STORE, JSON.stringify({ 'identity:OLDEST': '358', 'delivered:OLDEST:358': [m.id] }))
+    await start($)
+    const joined = await $.command.run({ command: 'comms-as', args: '358', ...PERSON })
+    expect(joined.text).toContain('this session is 358')
+    await turn($, 1)
+    expect(w.appended.some(t => t.includes('seen long ago'))).toBe(false)
+  })
+
   test('the Comms folder setting places the folder; HOME/agent-comms is only the default', { options: { folder: '/w/elsewhere' } }, async ($, on) => {
     const w = world(on, { identity: '358' })
     put(w, '/w/elsewhere/channels.json', JSON.stringify(DEFAULT_CONFIG))
@@ -571,7 +607,8 @@ describe('6. identity', () => {
     await turn($, 1)
     expect(w.status()).toBe('comms: not joined (/comms-as <id>)')
     expect(w.tools).toEqual([])
-    expect(w.lists).toEqual([])
+    // it never polls the comms folder (the one look at the old store folder is the import)
+    expect(w.lists.filter(p => p.startsWith(ROOT))).toEqual([])
     expect(w.appended).toEqual([])
     expect(w.ran).toEqual([])
   })
