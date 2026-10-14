@@ -961,8 +961,8 @@ const hold = async ($: Engine, ch: string, id: string) => {
 
 /**
  * Decline: records channels/<ch>/declined/<id>.json (never delivered, no
- * longer pending) and sends the reason to the reviewer who wrote it and to the
- * agent it was sent to; the agent does not get the declined text itself.
+ * longer pending) and sends the reason to the reviewer who wrote it, and to no
+ * one else: the agent is never told (the maintainer sees the note in the pane).
  */
 const decline = async ($: Engine, ch: string, id: string, reason: string) => {
   if (me !== MAINTAINER) return
@@ -981,14 +981,10 @@ const decline = async ($: Engine, ch: string, id: string, reason: string) => {
     return
   }
   const reasonLine = `Reason: ${why || '(no reason given)'}`
-  if (m.to === ALL) {
-    await postNote($, ch, ALL, `Declined: the maintainer declined ${withArticle(m.kind)} from ${m.from} to the group ("${firstLine(m.body)}"); it will not be delivered.\n${reasonLine}`)
-  } else {
-    await postNote($, ch, m.from, `Declined: your ${m.kind} to ${m.to} ("${firstLine(m.body)}") was not delivered.\n${reasonLine}`)
-    await postNote($, ch, m.to, `Declined: the maintainer declined ${withArticle(m.kind)} from ${m.from} to you; it will not be delivered.\n${reasonLine}`)
-  }
+  const toWhom = m.to === ALL ? `the group #${ch}` : m.to
+  await postNote($, ch, m.from, `Declined: your ${m.kind} to ${toWhom} ("${firstLine(m.body)}") was not delivered, and ${m.to === ALL ? 'the group was' : `${m.to} was`} not told.\n${reasonLine}`)
   await update($, decliningAtom, () => '')
-  await update($, infoAtom, () => `Declined; ${m.from} and ${m.to} were told why.`)
+  await update($, infoAtom, () => `Declined; only ${m.from} was told why.`)
   await scan($)
 }
 
@@ -1699,7 +1695,7 @@ export const register: Register = (on, options) => {
                     <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor="red" paddingX={1}>
                       <Input
                         key={`decline:${m.id}`}
-                        label={`✗ why decline? (sent to ${m.from} and ${m.to}): `}
+                        label={`✗ why decline? (only ${m.from} sees it): `}
                         placeholder="explain what to change"
                         value=""
                         submitLabel="decline"

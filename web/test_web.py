@@ -88,15 +88,14 @@ class CoreTests(World):
         self.assertEqual(len([x for x in self.messages("358") if x["from"] == "maintainer"]), 2)
         self.assertFalse(any(x["from"] == "maintainer" and x["to"] == "maintainer" for x in self.messages("358")))
 
-    def test_decline_records_the_reason_and_tells_both(self):
+    def test_decline_records_the_reason_and_tells_only_the_reviewer(self):
         m = self.seed("354", "reviewer", "354", "Rewrite the parser.")
         self.folder.decline("354", m["id"], "Too big for this PR.")
         with open(os.path.join(self.folder.channel_dir("354", "declined"), m["id"] + ".json")) as h:
             self.assertEqual(json.loads(h.read())["reason"], "Too big for this PR.")
         notes = {n["to"]: n["body"] for n in self.messages("354") if n["from"] == "maintainer"}
+        self.assertEqual(list(notes), ["reviewer"])  # the agent is never told
         self.assertIn("Reason: Too big for this PR.", notes["reviewer"])
-        self.assertIn("Reason: Too big for this PR.", notes["354"])
-        self.assertNotIn("Rewrite the parser.", notes["354"])
         item = next(x for x in self.thread("354") if x["id"] == m["id"])
         self.assertEqual((item["pending"], item["declined"]), (False, "Too big for this PR."))
         self.assertTrue(self.folder.approve("354", m["id"]).startswith("Not approved"))
@@ -323,6 +322,9 @@ class GroupTests(World):
         notes = [m for m in self.messages("team") if m["from"] == "maintainer" and m["body"].startswith("On hold")]
         self.assertEqual([(n["to"]) for n in notes], ["all"])  # ONE note to the group
         self.assertIn("to the group", notes[0]["body"])
+        self.folder.decline("team", waiting["id"], "Not yet.")
+        declines = [m for m in self.messages("team") if m["from"] == "maintainer" and m["body"].startswith("Declined")]
+        self.assertEqual([n["to"] for n in declines], ["reviewer"])  # no agent in the group is told
 
     def test_create_group_over_http(self):
         token = "k"

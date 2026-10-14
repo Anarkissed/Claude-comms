@@ -941,7 +941,7 @@ describe('Hold and Decline', () => {
     await ui.unmount()
   })
 
-  for (const surface of ['terminal', 'desktop'] as const) test(`${surface}: Decline opens a box; the reason goes to the agent it was sent to, the text is never delivered`, async ($, on) => {
+  for (const surface of ['terminal', 'desktop'] as const) test(`${surface}: Decline opens a box; the reason goes to the reviewer only, never the agent; the text is never delivered`, async ($, on) => {
     {
       const w = world(on, { identity: 'maintainer' })
       const m = seedMessage(w, '354', { from: 'reviewer', to: '354', body: 'Rewrite the parser.', at: T0 - 1000, hex: surface === 'terminal' ? 'dec001' : 'dec002' })
@@ -954,11 +954,11 @@ describe('Hold and Decline', () => {
       await ui.input({ key: `decline:${m.id}`, text: 'Too big for this PR; open an issue instead.' })
       const record = w.files.get(`${ROOT}/channels/354/declined/${m.id}.json`)
       expect(record).toBe(`{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T12:00:00.000Z","reason":"Too big for this PR; open an issue instead."}\n`)
-      const notes = notesTo(w, '354', '354')
-      expect(notes.map(n => n.body)).toEqual(['Declined: the maintainer declined a ruling from reviewer to you; it will not be delivered.\nReason: Too big for this PR; open an issue instead.'])
-      expect(notes[0]?.body).not.toContain('Rewrite the parser.')
+      // the agent is told nothing: no note to it, nothing addressed to everyone
+      expect(notesTo(w, '354', '354')).toEqual([])
+      expect(notesTo(w, '354', 'all')).toEqual([])
       expect(notesTo(w, '354', 'reviewer').map(n => n.body)).toEqual([
-        'Declined: your ruling to 354 ("Rewrite the parser.") was not delivered.\nReason: Too big for this PR; open an issue instead.',
+        'Declined: your ruling to 354 ("Rewrite the parser.") was not delivered, and 354 was not told.\nReason: Too big for this PR; open an issue instead.',
       ])
       expect(await ui.find({ type: 'Text', text: /declined: Too big for this PR/ })).toBeDefined()
       expect(await ui.find({ key: `approve:${m.id}` })).toBeUndefined()
@@ -1310,6 +1310,20 @@ describe('group chats (several agents and the reviewer)', () => {
     await start($)
     const r = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'all', kind: 'note', text: 'hi' })
     expect(denial(r)).toContain('you are in no such group')
+  })
+
+  test('Decline on a group message tells only the reviewer; no agent in the group is told', async ($, on) => {
+    const w = world(on, { identity: 'maintainer', config: TEAM })
+    const m = seedMessage(w, 'team', { from: 'reviewer', to: 'all', body: 'Freeze the API.', at: T0 - 1000, hex: 'grp009' })
+    await start($)
+    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    await ui.press({ key: 'ch:team' })
+    await ui.press({ key: `decline-open:${m.id}` })
+    await ui.input({ key: `decline:${m.id}`, text: 'Not yet.' })
+    const notes = groupFiles(w).filter(n => n.from === 'maintainer')
+    expect(notes.map(n => n.to)).toEqual(['reviewer'])
+    expect(notes[0]?.body).toContain('Reason: Not yet.')
+    await ui.unmount()
   })
 
   test('Hold on a group message sends ONE note to the group; the pane offers "to everyone"', async ($, on) => {

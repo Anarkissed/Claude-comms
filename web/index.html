@@ -311,7 +311,7 @@
   const approvalOf = m => {
     if (!m.pending) return ''
     if (declining === m.id) {
-      return `<div class="declinebox"><textarea id="reason" rows="2" placeholder="Why decline? Sent to ${esc(m.from)} and ${esc(m.to)}."></textarea>` +
+      return `<div class="declinebox"><textarea id="reason" rows="2" placeholder="Why decline? Only ${esc(m.from)} sees it."></textarea>` +
         `<button class="chip no" data-decline-send="${esc(m.id)}">Decline</button><button class="chip" data-decline-cancel="1">Cancel</button></div>`
     }
     return `<div class="approval"><span class="label">${m.held ? '⏸ On Hold' : '⏳ Needs your approval'}</span>` +

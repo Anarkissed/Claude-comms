@@ -352,12 +352,11 @@ class Folder:
         reason = reason.strip()
         write_atomic(self.channel_dir(ch, "declined"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": iso_now(), "reason": reason}) + "\n")
         line = f"Reason: {reason or '(no reason given)'}"
-        if m["to"] == ALL:
-            self._note(ch, ALL, f"Declined: the maintainer declined {with_article(m['kind'])} from {m['from']} to the group (\"{first_line(m['body'])}\"); it will not be delivered.\n{line}")
-        else:
-            self._note(ch, m["from"], f"Declined: your {m['kind']} to {m['to']} (\"{first_line(m['body'])}\") was not delivered.\n{line}")
-            self._note(ch, m["to"], f"Declined: the maintainer declined {with_article(m['kind'])} from {m['from']} to you; it will not be delivered.\n{line}")
-        return f"✗ Declined; {m['from']} and {m['to']} were told why."
+        # only the reviewer who wrote it is told; the agent (or the group) never is
+        to_whom = f"the group #{ch}" if m["to"] == ALL else m["to"]
+        untold = "the group was" if m["to"] == ALL else f"{m['to']} was"
+        self._note(ch, m["from"], f"Declined: your {m['kind']} to {to_whom} (\"{first_line(m['body'])}\") was not delivered, and {untold} not told.\n{line}")
+        return f"✗ Declined; only {m['from']} was told why."
 
     def post(self, ch: str, to: str, kind: str, text: str) -> str:
         cfg = self.config()
