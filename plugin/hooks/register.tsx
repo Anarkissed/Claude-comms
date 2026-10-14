@@ -172,6 +172,8 @@ let storeFull = false
 let heldByPerson = false
 /** The user-turn count at the last turn's start: a smaller or equal count at the next start means a rewind. */
 let lastTurns = -1
+/** Per channel, the oldest message id this session is still owed (waiting for approval included): a capped list's floor stays below it. */
+const oldestOwed = new Map<string, string>()
 /** Per channel, the approvals the last scan found: the delivered text says "approved" only for these. */
 const approvedNow = new Map<string, Set<string>>()
 /** Messages already announced (toast, phone notice) in this process, so a store that refuses the record does not announce them every poll. */
@@ -320,15 +322,13 @@ const recheckDeliveries = async ($: Engine) => {
     ? recent.filter((r): r is { ch: string; id: string } => typeof r === 'object' && r !== null && typeof (r as { ch?: unknown }).ch === 'string' && typeof (r as { id?: unknown }).id === 'string')
     : []
   if (list.length === 0) return
-  const rows = await $.session.messages().catch(() => undefined)
+  // the conversation as the model gets it: the rows this plugin appends are meta rows, which the
+  // plain form of $.session.messages() leaves out (a /clear and a compaction empty the list themselves)
+  const rows = await $.session.messages({ as: 'api' }).catch(() => undefined)
   if (rows === undefined || rows.length >= 4096) return
-  // an empty conversation (a /clear, a fresh start) holds nothing delivered before it, on purpose:
-  // none of those messages is cut out by a rewind, and none may be sent again later
-  if (rows.length < 2) {
-    await $.store.set(recentKey(), [])
-    return
-  }
-  const text = rows.map(r => r.text).join('\n')
+  const text = rows
+    .flatMap(row => (Array.isArray(row.content) ? row.content : []).flatMap(block => (block.type === 'text' && typeof block.text === 'string' ? [block.text] : [])))
+    .join('\n')
   const lost = list.filter(r => !text.includes(`(id ${r.id})`))
   if (lost.length === 0) return
   for (const ch of new Set(lost.map(r => r.ch))) {
@@ -349,7 +349,14 @@ const recheckDeliveries = async ($: Engine) => {
  * takes it back (/resume); otherwise this session carries its identity and
  * records over to the new transcript (/clear).
  */
-const followTranscript = async ($: Engine) => {
+let following: Promise<void> | undefined
+const followTranscript = ($: Engine): Promise<void> => {
+  following ??= followTranscriptOnce($).finally(() => {
+    following = undefined
+  })
+  return following
+}
+const followTranscriptOnce = async ($: Engine) => {
   const now = await $.session.id().catch(() => undefined)
   if (now === undefined || now === sessionId) return
   const earlier = sessionId
@@ -438,6 +445,11 @@ const importFolderLoadedStore = async ($: Engine) => {
   const sharedFirst = (await $.store.get('imported:shared')) !== true
   for (const data of stores) {
     for (const [key, value] of Object.entries(data)) {
+      const floorOf = ids.find(id => key.startsWith(`floor:${id}:`))
+      if (floorOf !== undefined) {
+        await raiseFloor($, key, value)
+        continue
+      }
       const isMyList = ids.some(id => key.startsWith(`delivered:${id}:`) || key === `notified:${id}` || key === `woken:${id}`)
       if (isMyList) {
         const merged = new Set([...asList(await $.store.get(key)), ...asList(value)])
@@ -483,10 +495,7 @@ const takeRecordsOf = async ($: Engine, earlier: string) => {
   if (earlier === owner()) return
   for (const key of await $.store.keys()) {
     if (key.startsWith(`floor:${earlier}:`)) {
-      const target = key.replace(earlier, owner())
-      const theirs = await $.store.get(key)
-      const mine = await $.store.get(target)
-      if (typeof theirs === 'string' && (typeof mine !== 'string' || theirs.localeCompare(mine) > 0)) await $.store.set(target, theirs)
+      await raiseFloor($, key.replace(earlier, owner()), await $.store.get(key))
       await $.store.delete(key)
       continue
     }
@@ -503,7 +512,17 @@ const takeRecordsOf = async ($: Engine, earlier: string) => {
     sentNow.set(target, new Set([...(sentNow.get(target) ?? []), ...ids]))
     sentNow.delete(key)
   }
-  for (const key of [`recent:${earlier}`, `transcript:${earlier}`, `active:${earlier}`]) await $.store.delete(key)
+  // a join made before setup is registered by this owner's polls now
+  const pending = await $.store.get(`unregistered:${earlier}`)
+  if (typeof pending === 'string' && (await $.store.get(unregisteredKey())) === undefined) await $.store.set(unregisteredKey(), pending)
+  for (const key of [`recent:${earlier}`, `transcript:${earlier}`, `active:${earlier}`, `unregistered:${earlier}`]) await $.store.delete(key)
+}
+
+/** Keeps the later of the floor stored under `target` and `theirs` (ids at or before a floor count as delivered). */
+const raiseFloor = async ($: Engine, target: string, theirs: unknown) => {
+  if (typeof theirs !== 'string') return
+  const mine = await $.store.get(target)
+  if (typeof mine !== 'string' || theirs.localeCompare(mine) > 0) await $.store.set(target, theirs)
 }
 
 /**
@@ -521,6 +540,10 @@ const takeOverAgent = async ($: Engine, id: string) => {
       const earlier = key.slice('identity:'.length)
       await $.store.set(releasedKey(earlier), true)
       for (const [k, v] of Object.entries(data)) {
+        if (k.startsWith(`floor:${earlier}:`)) {
+          await raiseFloor($, k.replace(earlier, owner()), v)
+          continue
+        }
         const isTheirs = k.startsWith(`delivered:${earlier}:`) || k === `notified:${earlier}` || k === `woken:${earlier}`
         if (!isTheirs) continue
         const target = k.replace(earlier, owner())
@@ -789,11 +812,16 @@ const markDelivered = async ($: Engine, ch: string, ids: readonly string[]) => {
     const stored = new Set(asList(await $.store.get(key)))
     for (const id of ids) stored.add(id)
     let list = [...stored]
-    // a long record keeps its newest ids; the floor stands for the rest (ids sort by their time)
+    // a long record keeps its newest ids; the floor stands for the rest (ids sort by their time), and never
+    // passes a message still owed to this session (one waiting for approval, a hand-written id out of order)
     if (list.length > DELIVERED_CAP) {
       list.sort((a, b) => a.localeCompare(b))
-      const dropped = list.slice(0, list.length - DELIVERED_KEEP)
-      list = list.slice(-DELIVERED_KEEP)
+      const owed = oldestOwed.get(ch)
+      const droppable = list.length - DELIVERED_KEEP
+      let cut = 0
+      while (cut < droppable && (owed === undefined || (list[cut] ?? '').localeCompare(owed) < 0)) cut += 1
+      const dropped = list.slice(0, cut)
+      list = list.slice(cut)
       const floor = dropped.at(-1)
       const was = await $.store.get(floorKey(ch))
       if (floor !== undefined && (typeof was !== 'string' || floor.localeCompare(was) > 0)) await $.store.set(floorKey(ch), floor)
@@ -815,9 +843,11 @@ const agentStatus = (mine: readonly Channel[]): string =>
 const scanAsAgent = async ($: Engine, cfgIn: Config, self: string, gen: number) => {
   let cfg = cfgIn
   let mine = channelsFor(cfg, self)
+  const pending = await $.store.get(unregisteredKey()).catch(() => undefined)
+  // the agent has a channel (setup, /comms-as or /comms-group gave it one): nothing is pending any more
+  if (pending !== undefined && mine.length > 0 && gen === generation) await quietly($, () => $.store.delete(unregisteredKey()))
   if (mine.length === 0) {
     // joined before the folder was set up (possibly set up from another session): registered now
-    const pending = await $.store.get(unregisteredKey()).catch(() => undefined)
     if (pending === self && isNewAgentId(self, cfg) && gen === generation) {
       const registration = await registerAgent($, self)
       if (registration.ok) {
@@ -840,6 +870,14 @@ const scanAsAgent = async ($: Engine, cfgIn: Config, self: string, gen: number) 
       m => isDeliverable(m, self, scanned.approved, cfg.require_approval, scanned.declined) && !delivered.has(m.id),
     )
     next.set(channel.id, fresh)
+    // the oldest message still owed here, whatever its approval state: a capped delivered list keeps it
+    const exact = new Set([...asList(await $.store.get(deliveredKey(channel.id)).catch(() => undefined)), ...(sentNow.get(deliveredKey(channel.id)) ?? [])])
+    const owed = scanned.messages
+      .filter(m => (m.to === self || (m.to === ALL && isGroup(channel))) && m.from !== self && !scanned.declined.has(m.id) && !exact.has(m.id))
+      .map(m => m.id)
+      .sort((a, b) => a.localeCompare(b))[0]
+    if (owed === undefined) oldestOwed.delete(channel.id)
+    else oldestOwed.set(channel.id, owed)
   }
   // the identity changed while this poll ran (/comms-as off, a switch, a take-over): change nothing
   if (gen !== generation || me !== self) return
@@ -1170,7 +1208,7 @@ const guard = async ($: Engine, e: ToolCallInput): Promise<string | undefined> =
         // spellings no file system call can place (macOS /.vol/<dev>/<inode>, a network path that names
         // the folder) are denied rather than placed somewhere else
         if (/^\/\.vol\//i.test(abs)) return denyText(root)
-        if (/^\/\/[^/]/.test(abs) && abs.toLowerCase().includes(`/${base(root).toLowerCase()}`)) return denyText(root)
+        if (/^\/\/[^/]/.test(abs) && abs.normalize('NFC').toLowerCase().split('/').includes(base(root).normalize('NFC').toLowerCase())) return denyText(root)
         const placed = await placeReal($, abs)
         if (placed !== undefined && roots.some(r => isInside(placed, r))) return denyText(root)
       }
@@ -1345,6 +1383,19 @@ const approve = async ($: Engine, ch: string, id: string): Promise<string> => {
 
 const heldKey = () => 'held:maintainer'
 
+/** When a hold's record was claimed (its "ts"), in milliseconds; undefined when it does not say. */
+const heldTime = async ($: Engine, ch: string, id: string): Promise<number | undefined> => {
+  const text = await $.fs.read(`${paths.held(ch)}/${id}.json`).catch(() => undefined)
+  try {
+    const value: unknown = typeof text === 'string' ? JSON.parse(text) : undefined
+    const ts = typeof value === 'object' && value !== null ? (value as { ts?: unknown }).ts : undefined
+    const at = typeof ts === 'string' ? Date.parse(ts) : Number.NaN
+    return Number.isNaN(at) ? undefined : at
+  } catch {
+    return undefined
+  }
+}
+
 /** A hold's record, channels/<ch>/held/<id>.json: who has been told so far ("all" for a group). */
 const formatHeld = (id: string, ts: string, told: readonly string[]): string => `${JSON.stringify({ id, by: MAINTAINER, ts, told })}\n`
 
@@ -1399,12 +1450,28 @@ const safeText = (text: string, max = DRAW_LIMIT): string => {
  */
 const revealInvisible = (text: string): { text: string; count: number } => {
   let count = 0
-  const shown = text.replace(/[\p{Cf}\p{Co}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]/gu, ch => {
+  // emoji sequences stay whole (their variation selectors, ZWJ and tag characters are what draws them);
+  // every other format, private-use, variation-selector, tag or control character is shown and counted
+  // eslint-disable-next-line no-control-regex
+  const shown = wellFormed(text).replace(/\r\n?/g, '\n').replace(/(\u{1F3F4}[\u{E0061}-\u{E007A}]+\u{E007F}|[#*0-9]\u{FE0F}?\u{20E3}|\p{Regional_Indicator}{2}|\p{Extended_Pictographic}[\u{FE0E}\u{FE0F}]?\p{Emoji_Modifier}?(?:\u{200D}\p{Extended_Pictographic}[\u{FE0E}\u{FE0F}]?\p{Emoji_Modifier}?)*)|[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}\p{Co}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]/gu, (whole, emoji: string | undefined) => {
+    if (emoji !== undefined) return whole
     count += 1
-    return `⟨U+${(ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}⟩`
+    return `⟨U+${(whole.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}⟩`
   })
 
   return { text: shown, count }
+}
+
+/** Terminal cells a character takes: 0 for combining marks and joiners, 2 for wide (East Asian, emoji), 1 otherwise. */
+const cellsOf = (ch: string): number => {
+  const cp = ch.codePointAt(0) ?? 0
+  if (/[\p{Mn}\p{Me}\u200D\uFE0F]/u.test(ch)) return 0
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) || (cp >= 0x20000 && cp <= 0x3fffd)
+  ) return 2
+  return 1
 }
 
 /** The start of a long message, cut at a line end near PREVIEW_CHARS. */
@@ -1472,6 +1539,12 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
   if (scanned.held.has(id) || legacy.has(id)) {
     const recorded = scanned.held.get(id)
     told = recorded ?? recipients
+    // a record still missing recipients, written in the last 30 s, is a hold another desk is sending now
+    const at = await heldTime($, ch, id)
+    if (recorded !== undefined && recipients.some(r => !recorded.includes(r)) && at !== undefined && (await $.clock.now()) - at < 30_000) {
+      await update($, infoAtom, () => 'That hold is being sent from another desk right now; press Hold again in a moment if it does not finish.')
+      return
+    }
   } else {
     const claim = await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, []))
     if (!claim.ok) {
@@ -2150,7 +2223,9 @@ export const register: Register = (on, options) => {
     await quietly($, () => update($, turnAtom, () => e.turnId))
     endOfTurnRows = new Map()
     heldByPerson = false
-    // the transcript may have changed with no session.start (/clear, /resume), joined or not
+    // the transcript may have changed with no session.start (/clear, /resume), joined or not; a poll
+    // already running finishes first, so it never reads records under an owner that changes beneath it
+    if (scanning) await scanning
     await followTranscript($)
     // fewer or as many user turns as at the last turn's start: the conversation was rewound in place,
     // and what was delivered after the point it went back to may be gone from it
@@ -2272,19 +2347,47 @@ export const register: Register = (on, options) => {
     const width = Math.max(20, Math.floor(e.props.bodyColumns * 0.85) - 4)
     const room = isPinned ? Math.max(4, bodyRows - 16) : 200
     const pendingView = (m: CommsThreadItem) => {
-      const revealed = revealInvisible(fullOf(m))
+      // the raw text, so controls and U+10EEEE are shown as ⟨U+…⟩ rather than silently dropped
+      const revealed = revealInvisible(fullBodies.get(`${chosen}/${m.id}`) ?? m.body)
+      // wrapped by terminal cells (wide characters take two; a tab goes to the next stop of 8)
       const lines = revealed.text.split('\n').flatMap(line => {
-        const points = Array.from(line)
-        if (points.length <= width) return [line]
         const out: string[] = []
-        for (let i = 0; i < points.length; i += width) out.push(points.slice(i, i + width).join(''))
+        let piece = ''
+        let cells = 0
+        for (const ch of Array.from(line.replace(/\t/g, '        '))) {
+          const w = cellsOf(ch)
+          if (cells + w > width && piece !== '') {
+            out.push(piece)
+            piece = ''
+            cells = 0
+          }
+          piece += ch
+          cells += w
+        }
+        out.push(piece)
         return out
       })
-      const pageCount = Math.max(1, Math.ceil(lines.length / room))
+      // pages of at most `room` lines and EXPANDED_CHARS characters, so no page's text is ever cut
+      const starts: number[] = [0]
+      let count = 0
+      let chars = 0
+      lines.forEach((line, i) => {
+        const cost = line.length + 1
+        if (count > 0 && (count >= room || chars + cost > EXPANDED_CHARS)) {
+          starts.push(i)
+          count = 0
+          chars = 0
+        }
+        count += 1
+        chars += cost
+      })
+      const pageCount = starts.length
       const page = Math.max(0, Math.min(pageCount - 1, pages[m.id] ?? 0))
-      const shownLines = lines.slice(page * room, page * room + room)
+      const from = starts[page] ?? 0
+      const to = starts[page + 1] ?? lines.length
+      const shownLines = lines.slice(from, to)
 
-      return { text: safeText(shownLines.join('\n'), EXPANDED_CHARS), page, pageCount, lineCount: lines.length, first: page * room + 1, last: page * room + shownLines.length, invisible: revealed.count }
+      return { text: safeText(shownLines.join('\n'), Number.MAX_SAFE_INTEGER), page, pageCount, lineCount: lines.length, first: from + 1, last: to, invisible: revealed.count }
     }
     const textOf = (m: CommsThreadItem): string => {
       if (m.pending) return pendingView(m).text

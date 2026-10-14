@@ -8,6 +8,8 @@ import json
 import os
 import re
 import secrets
+import sys
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -21,6 +23,10 @@ SETUP_MARKER = "[agent-comms setup]"
 ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,32}\Z")
 TS_RE = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z\Z")
 SEEN_CAP = 1000
+# one maintainer action at a time on a message: a double click, or two desk pages, never sends notes twice
+_ACTION_LOCK = threading.Lock()
+# a hold record still missing recipients, claimed this recently, is being sent by another desk right now
+HOLD_IN_PROGRESS_S = 30
 
 
 def is_id(value: Any) -> bool:
@@ -285,6 +291,15 @@ class Folder:
                 unreadable.add(name[:-5])
         return out
 
+    def held_claimed_at(self, ch: str, mid: str) -> Optional[float]:
+        """When a hold's record was claimed (its "ts"), in seconds since the epoch; None when it does not say."""
+        try:
+            with open(os.path.join(self.channel_dir(ch, "held"), mid + ".json"), encoding="utf-8") as handle:
+                ts = json.loads(handle.read()).get("ts")
+            return datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+        except (OSError, ValueError, AttributeError, TypeError):
+            return None
+
     def held_records(self, ch: str) -> Dict[str, Optional[List[str]]]:
         """Messages on hold: channels/<ch>/held/<id>.json, written by this desk or the plugin's pane, each with
         who was told so far ("told"); None when the record does not say (an older one: everyone)."""
@@ -353,7 +368,11 @@ class Folder:
         cfg = self.config()
         if cfg is None:
             return {"ok": False, "error": "channels.json is missing or unreadable: run /comms-setup in Claude Code first."}
-        self.migrate_legacy_held(cfg)
+        try:
+            self.migrate_legacy_held(cfg)
+        except OSError as error:
+            # the page still loads: the old list is still read below, and the move is tried again next poll
+            print(f"agent-comms web: could not move the old holds into files: {error}", file=sys.stderr, flush=True)
         state = self.state()
         seen = state.get("seen", {})
         legacy_held = set(state.get("held", []))
@@ -361,7 +380,16 @@ class Folder:
         for channel in cfg["channels"]:
             messages, skipped, missing, approved, declined = self.scan(channel)
             is_seen = seen_test(seen.get(channel["id"]))
-            held = legacy_held | self.held_ids(channel["id"])
+            records = self.held_records(channel["id"])
+
+            def is_held(m, records=records):
+                # on hold once everyone it concerns was told; an unfinished hold keeps its Hold button
+                if m["id"] in legacy_held:
+                    return True
+                if m["id"] not in records:
+                    return False
+                told = records[m["id"]]
+                return told is None or all(r in told for r in ([ALL] if m["to"] == ALL else [m["from"], m["to"]]))
             reviewers = reviewers_of(channel)
             for m in messages:
                 for i in (m["from"], m["to"]):
@@ -376,7 +404,7 @@ class Folder:
                 items.append({
                     **m,
                     "pending": waiting,
-                    "held": waiting and m["id"] in held,
+                    "held": waiting and is_held(m),
                     "declined": declined.get(m["id"]),
                     "approved": m["id"] in approved,
                     "needs_approval": needs_approval(m),
@@ -443,6 +471,10 @@ class Folder:
     def hold(self, ch: str, mid: str) -> str:
         """The hold is a file the plugin's pane reads too: its first writer tells the others, the second tells no
         one twice. The file records who was told, so a note that failed is sent at the next Hold."""
+        with _ACTION_LOCK:
+            return self._hold(ch, mid)
+
+    def _hold(self, ch: str, mid: str) -> str:
         m, why = self._find_waiting(ch, mid)
         if m is None:
             return f"Not held: {why}"
@@ -452,6 +484,10 @@ class Folder:
         records = self.held_records(ch)
         if mid in records or mid in set(self.state().get("held", [])):
             told = records.get(mid) or (recipients if records.get(mid) is None else [])
+            claimed = self.held_claimed_at(ch, mid)
+            unfinished = records.get(mid) is not None and any(r not in told for r in recipients)
+            if unfinished and claimed is not None and time.time() - claimed < HOLD_IN_PROGRESS_S:
+                return "That hold is being sent from another desk right now; press Hold again in a moment if it does not finish."
         else:
             try:
                 self._write_held(ch, mid, ts, [], replace=False)
@@ -475,6 +511,10 @@ class Folder:
         return f"⏸ On hold: {m['from']} and {agent_side} were told to expect a message soon."
 
     def decline(self, ch: str, mid: str, reason: str) -> str:
+        with _ACTION_LOCK:
+            return self._decline(ch, mid, reason)
+
+    def _decline(self, ch: str, mid: str, reason: str) -> str:
         """The reviewer always gets the reason. The agent (or the group) is told nothing, unless the
         message was on hold: then it was promised word, and is told only that it was declined."""
         m, why = self._find_waiting(ch, mid)

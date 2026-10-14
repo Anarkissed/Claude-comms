@@ -473,6 +473,26 @@ class AuditFixTests(World):
         self.assertEqual(len(to_agent), 1)
         self.assertTrue(self.folder.hold("358", m["id"]).startswith("Already on hold"))
 
+    def test_an_unfinished_hold_keeps_its_hold_button(self):
+        m = self.seed("358", "reviewer", "358", "half held", hexid="aud012")
+        core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": "2026-10-08T12:00:01.000Z", "told": ["reviewer"]}) + "\n")
+        self.assertFalse(next(x for x in self.thread("358") if x["id"] == m["id"])["held"])
+
+    def test_a_hold_another_desk_claimed_moments_ago_is_left_to_it(self):
+        m = self.seed("358", "reviewer", "358", "in progress", hexid="aud013")
+        core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": core.iso_now(), "told": ["reviewer"]}) + "\n")
+        self.assertIn("another desk", self.folder.hold("358", m["id"]))
+        self.assertFalse(any(n["body"].startswith("On hold") for n in self.messages("358")))
+
+    def test_two_holds_at_once_send_one_set_of_notes(self):
+        m = self.seed("358", "reviewer", "358", "double press", hexid="aud014")
+        threads = [threading.Thread(target=self.folder.hold, args=("358", m["id"])) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len([n for n in self.messages("358") if n["body"].startswith("On hold")]), 2)
+
     def test_decline_says_nothing_is_coming_only_to_a_side_that_heard_of_the_hold(self):
         m = self.seed("358", "reviewer", "358", "never told", hexid="aud009")
         core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": "2026-10-08T12:00:01.000Z", "told": []}) + "\n")

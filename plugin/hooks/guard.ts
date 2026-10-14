@@ -26,6 +26,9 @@ export const EXEMPT_TOOLS = new Set([
   // report-only: a subagent's result and a code review's findings write nothing
   'StructuredOutput',
   'ReportFindings',
+  // shows or sends an existing file to the person: reads only
+  'SendUserFile',
+  'SendFile',
 ])
 
 /** Input keys holding a path the tool will touch. */
@@ -96,6 +99,8 @@ export const absolutize = (path: string, cwd: string, home: string, onWindows = 
   const h = toSlashes(home)
   // a file:// address names the same path
   let p = path.trim().replace(/^file:\/\/(localhost)?(?=\/)/i, '')
+  // file:///C:/x names C:/x (a URL keeps a slash before the drive)
+  if (/^file:/i.test(path.trim()) && /^\/[A-Za-z]:[\\/]/.test(p)) p = p.slice(1)
   try {
     if (/%[0-9A-Fa-f]{2}/.test(p) && path.trim().toLowerCase().startsWith('file:')) p = decodeURIComponent(p)
   } catch {
@@ -174,9 +179,49 @@ const FIND_WRITES = /^-(delete|rm|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/
  * parenthesis (command or process substitution, a subshell, PowerShell's
  * (...) and @(...)) and no backquote. Best effort, like the rest of the shell check.
  */
+/**
+ * The command with quoted text blanked to spaces (same length): single-quoted text is literal in bash, zsh
+ * and PowerShell; double-quoted text too, except `$(`…`)` and backquotes, which are kept so they still count.
+ */
+const blankQuoted = (command: string): string => {
+  let out = ''
+  let quote: '' | "'" | '"' = ''
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i] ?? ''
+    if (quote === '') {
+      if (ch === "'" || ch === '"') quote = ch
+      out += ch
+    } else if (ch === quote) {
+      quote = ''
+      out += ch
+    } else if (quote === '"' && (ch === '`' || (ch === '$' && command[i + 1] === '(') || (ch === '(' && command[i - 1] === '$'))) {
+      out += ch
+    } else {
+      out += ' '
+    }
+  }
+
+  return out
+}
+
+/** git options before the subcommand that change nothing about what runs. */
+const HARMLESS_GIT_GLOBALS = new Set(['--no-pager', '-P', '--no-optional-locks', '--literal-pathspecs', '--no-replace-objects'])
+
 export const isReadOnlyCommand = (command: string): boolean => {
-  if (/[`()]|>(?!\s*&?\s*(1|2|\/dev\/null)\b)|\btee\b/.test(command)) return false
-  const parts = command.split(/;|&&|\|\||\|&?|(?<![<>])&(?!>)|\r|\n/).map(part => part.trim()).filter(Boolean)
+  const bare = blankQuoted(command)
+  if (/[`()]|>(?!\s*&?\s*(1|2|\/dev\/null)\b)|\btee\b/.test(bare)) return false
+  // split where the shell would, found on the quote-blanked text (a ; inside quotes is not a separator)
+  const parts: string[] = []
+  let from = 0
+  for (const sep of bare.matchAll(/;|&&|\|\||\|&?|(?<![<>])&(?!>)|\r|\n/g)) {
+    parts.push(command.slice(from, sep.index))
+    from = (sep.index ?? 0) + sep[0].length
+  }
+  parts.push(command.slice(from))
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    parts[i] = (parts[i] ?? '').trim()
+    if (parts[i] === '') parts.splice(i, 1)
+  }
   if (parts.length === 0) return false
   return parts.every(part => {
     const raw = part.split(/\s+/)
@@ -190,8 +235,10 @@ export const isReadOnlyCommand = (command: string): boolean => {
     const program = (words[0] ?? '').replace(/^.*\//, '')
     const args = words.slice(1)
     if (program === 'git') {
-      // global options before the subcommand (-c, -C, --exec-path, --git-dir…) can change what runs
-      const sub = args[0] ?? ''
+      // global options before the subcommand (-c, --exec-path, --git-dir…) can change what runs; a few cannot
+      let first = 0
+      while (first < args.length && HARMLESS_GIT_GLOBALS.has(args[first] ?? '')) first += 1
+      const sub = args[first] ?? ''
       if (!READ_ONLY_GIT.has(sub)) return false
       return !args.some(w => /^--(output|ext-diff|open-files-in-pager|textconv)(=|$)|^-O/.test(w))
     }

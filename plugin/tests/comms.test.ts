@@ -50,6 +50,8 @@ type World = {
   messages: string[]
   /** The user-turn count ($.session.turns()). */
   turns: number
+  /** Texts a rewind took out of the conversation: rows holding any of them are gone from the api form. */
+  cut: string[]
 }
 
 const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/'
@@ -119,6 +121,7 @@ const world = (on: On, options: WorldOptions = {}): World => {
     sid: options.sid ?? SID,
     messages: [...(options.messages ?? [])],
     turns: 0,
+    cut: [],
   }
   let statusText: string | undefined
   w.keeps = keeps
@@ -244,7 +247,14 @@ const world = (on: On, options: WorldOptions = {}): World => {
     return { ...ok, exitCode: 127 }
   }
   on('session.id', () => ({ value: w.sid }))
-  on('session.messages', () => ({ value: w.messages.map(text => ({ role: 'user', text, toolUses: [] })) }))
+  // the plain form leaves out the rows the plugin appends (meta rows), as the engine does; the api form,
+  // what the model reads, holds them too, minus any a test cut out (a rewind)
+  on('session.messages', ($, e) => {
+    const asApi = (e as { as?: string } | undefined)?.as === 'api'
+    if (!asApi) return { value: w.messages.map(text => ({ role: 'user', text, toolUses: [] })) }
+    const rows = [...w.messages, ...w.appended].filter(text => !w.cut.some(part => text.includes(part)))
+    return { value: rows.map(text => ({ role: 'user', content: [{ type: 'text', text }] })) }
+  })
   on('session.turns', () => ({ value: w.turns }))
   on('session.cwd', () => ({ value: options.windows ? 'C:\\work' : CWD }))
   on('prompt.submit', ($, e) => {
@@ -2177,10 +2187,40 @@ describe('second review fixes (2026-10-14)', () => {
     w.turns = 2
     await turn($, 2)
     expect(w.appended.filter(t => t.includes('will be rewound away'))).toHaveLength(1)
-    // the person rewinds to before turn 2 and types again: the row is gone, the turn count is back to 2
-    w.messages = ['first prompt', 'first answer']
+    // the person rewinds to before turn 2 and types again: the delivered row is gone, the turn count is back to 2
+    w.cut = ['will be rewound away']
     await turn($, 3)
     expect(w.appended.filter(t => t.includes('will be rewound away'))).toHaveLength(2)
+  })
+
+  test('a turn that starts with the same turn count but nothing cut out sends nothing again and wakes no one', async ($, on) => {
+    const w = world(on, { identity: '358', messages: ['first prompt', 'first answer'] })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'delivered once', at: T0 - 1000, hex: 'b0000c' })
+    w.turns = 1
+    await start($)
+    w.turns = 2
+    await turn($, 2)
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+    const prompts = w.prompts.length
+    // two turns start without a counted prompt (another session's message, a task notification)
+    await turn($, 3)
+    await turn($, 4)
+    expect(w.appended.filter(t => t.includes('delivered once'))).toHaveLength(1)
+    expect(w.prompts.length).toBe(prompts)
+  })
+
+  test('a rewind of a later turn does not send an earlier turn\'s message again', async ($, on) => {
+    const w = world(on, { identity: '358', messages: ['p1', 'a1'] })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'turn two message', at: T0 - 1000, hex: 'b0000d' })
+    w.turns = 1
+    await start($)
+    w.turns = 2
+    await turn($, 2)
+    w.turns = 3
+    await turn($, 3)
+    // rewind only turn 3, retype: the turn-two row is still in the conversation
+    await turn($, 4)
+    expect(w.appended.filter(t => t.includes('turn two message'))).toHaveLength(1)
   })
 
   test('after a desktop /clear the delivered list starts over: a later restart does not send pre-clear messages again', async ($, on) => {
@@ -2208,11 +2248,24 @@ describe('second review fixes (2026-10-14)', () => {
   test('a hold whose notes were never sent is finished by the next Hold', async ($, on) => {
     const w = world(on, { identity: 'maintainer' })
     const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'retry', at: T0 - 1000, hex: 'b00005' })
-    put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T11:59:59.000Z","told":[]}\n`)
+    // claimed ten minutes ago and never finished: a hold whose notes failed
+    put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T11:50:00.000Z","told":[]}\n`)
     await start($)
     const ui = await mount($)
     await ui.press({ key: `hold:${m.id}` }).catch(() => undefined)
     expect(filesIn(w, '358').filter(n => n.body.startsWith('On hold'))).toHaveLength(2)
+    await ui.unmount()
+  })
+
+  test('a hold another desk claimed seconds ago is left to it: no second set of notes', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'in progress', at: T0 - 1000, hex: 'b0000e' })
+    put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T11:59:59.000Z","told":["reviewer"]}\n`)
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `hold:${m.id}` })
+    expect(filesIn(w, '358').filter(n => n.body.startsWith('On hold'))).toHaveLength(0)
+    expect(await ui.find({ type: 'Text', text: /being sent from another desk/ })).toBeDefined()
     await ui.unmount()
   })
 
@@ -2293,6 +2346,116 @@ describe('second review fixes (2026-10-14)', () => {
     expect(await ui.find({ type: 'Text', text: /lines 1–24 of 120/ })).toBeDefined()
     await ui.press({ key: `page-down:${m.id}` })
     expect(await ui.find({ type: 'Text', text: /lines 25–48 of 120/ })).toBeDefined()
+    await ui.unmount()
+  })
+})
+
+describe('third review fixes (2026-10-14)', () => {
+  const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
+    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+  const FOLDER = ROOT.slice(ROOT.lastIndexOf('/') + 1)
+  const DENIED = 'written only through'
+
+  test('a rewind to the very first prompt still delivers what it cut out', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'after the first prompt', nowMs: T0 - 1000, hex: 'c00001' })
+    const w = world(on, {
+      host: 'local_A',
+      sid: 'FORK',
+      messages: ['the first prompt'],
+      store: { 'identity:local_A': '358', 'delivered:local_A:358': [m.id], 'recent:local_A': [{ ch: '358', id: m.id }], 'transcript:local_A': 'BEFORE' },
+    })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    await start($)
+    await turn($, 1)
+    expect(w.appended.filter(t => t.includes('after the first prompt'))).toHaveLength(1)
+  })
+
+  test('terminal /clear carries a pending pre-setup registration to the new transcript', async ($, on) => {
+    const w = world(on, { config: null })
+    await start($)
+    await $.command.run({ command: 'comms-as', args: '363', ...PERSON })
+    w.sid = 'S2'
+    await turn($, 1)
+    expect(w.store.get('unregistered:S2')).toBe('363')
+    put(w, `${ROOT}/channels.json`, JSON.stringify(PUBLIC_DEFAULT))
+    await w.clock.advance(15_000)
+    const cfg = JSON.parse(w.files.get(`${ROOT}/channels.json`) ?? '{}') as { channels: { id: string }[] }
+    expect(cfg.channels.some(c => c.id === '363')).toBe(true)
+  })
+
+  test('the pending-registration mark goes once the agent has a channel, however it got one', async ($, on) => {
+    const w = world(on, { config: null })
+    await start($)
+    await $.command.run({ command: 'comms-as', args: '363', ...PERSON })
+    put(w, `${ROOT}/channels.json`, JSON.stringify({ ...PUBLIC_DEFAULT, channels: [...PUBLIC_DEFAULT.channels, { id: '363', members: ['reviewer', '363'] }] }))
+    await w.clock.advance(15_000)
+    expect(w.store.has(`unregistered:${SID}`)).toBe(false)
+  })
+
+  test('a capped delivered list never moves its floor past a message still waiting for approval', async ($, on) => {
+    const old = Array.from({ length: 3000 }, (_, i) => `2026-09-01T00-00-00.000Z-maintainer-${i.toString(16).padStart(6, '0')}`)
+    const w = world(on, { identity: '358', store: { 'delivered:S1:358': old } })
+    const waiting = newMessage({ from: 'reviewer', to: '358', kind: 'ruling', body: 'approved late', nowMs: Date.UTC(2026, 7, 31), hex: 'c00002' })
+    put(w, `${msgDir('358')}/${waiting.id}.json`, format(waiting))
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'new note', at: T0 - 1000, hex: 'c00003' })
+    await start($)
+    await turn($, 1)
+    expect(w.appended.some(t => t.includes('new note'))).toBe(true)
+    put(w, `${apprDir('358')}/${waiting.id}.json`, formatApproval({ id: waiting.id, by: 'maintainer', ts: '2026-10-03T12:00:00.000Z' }))
+    await turn($, 2)
+    expect(w.appended.some(t => t.includes('approved late'))).toBe(true)
+  })
+
+  test('a floor kept by the folder-loaded copy comes over with the session', async ($, on) => {
+    const w = world(on, { host: 'local_A' })
+    put(w, OLD_STORE, JSON.stringify({ 'identity:local_A': '358', 'floor:local_A:358': '2026-09-01T00-00-00.000Z-maintainer-0003e7' }))
+    await start($)
+    expect(w.store.get('floor:local_A:358')).toBe('2026-09-01T00-00-00.000Z-maintainer-0003e7')
+  })
+
+  test('guard: file:///C:/… on Windows, quoted parentheses and harmless git options, SendUserFile', async ($, on) => {
+    expect(absolutize(`file:///C:/Users/me/${FOLDER}/x.json`, 'C:/work', 'C:/Users/me', true)).toBe(`C:/Users/me/${FOLDER}/x.json`)
+    for (const ok of [`jq '.[] | select(.x)' f`, `grep 'a(b' f`, 'git --no-pager log', 'grep "x;y" f', 'rg "(a|b)" dir']) expect(isReadOnlyCommand(ok)).toBe(true)
+    for (const bad of ['cat "$(rm x)"', "grep 'x' f; rm y", 'git -c a=b log']) expect(isReadOnlyCommand(bad)).toBe(false)
+    world(on, { identity: '358' })
+    await start($)
+    expect(denial(await $.tool.call({ tool: 'SendUserFile', files: [`${ROOT}/channels/358/messages/x.json`], status: 'normal' }))).toBeUndefined()
+  })
+
+  test('Windows: a network folder whose name only starts like the comms folder is not refused', async ($, on) => {
+    world(on, { identity: '358', windows: true })
+    await start($)
+    expect(denial(await $.tool.call({ tool: 'Write', file_path: `\\\\nas\\dev\\${FOLDER}-web\\x.txt`, content: 'x' }))).toBeUndefined()
+    expect(denial(await $.tool.call({ tool: 'Write', file_path: `\\\\nas\\share\\${FOLDER}\\x.json`, content: 'x' }))).toContain(DENIED)
+  })
+
+  test('ordinary emoji in a waiting message are not flagged as invisible characters', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'ok ⚠️ ✔️ 👨‍👩‍👧 🏳️‍🌈 👍🏽 1️⃣ 🇫🇷', at: T0 - 1000, hex: 'c00004' })
+    await start($)
+    const ui = await mount($)
+    expect(await ui.find({ type: 'Text', text: /invisible character/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /⟨U\+/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('control characters and U+10EEEE in a waiting message are shown, not dropped', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'a\u0007b\u{10EEEE}c', at: T0 - 1000, hex: 'c00005' })
+    await start($)
+    const ui = await mount($)
+    expect(await ui.find({ type: 'Text', text: /a⟨U\+0007⟩b⟨U\+10EEEE⟩c/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('wide characters are wrapped by terminal cells, so a page fits the pane', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const body = Array.from({ length: 100 }, () => '漢'.repeat(100)).join('\n')
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body, at: T0 - 1000, hex: 'c00006' })
+    await start($)
+    const ui = await mount($)
+    // 100 wide characters take 200 cells: three pieces of at most 98 cells each, per line
+    expect(await ui.find({ type: 'Text', text: /of 300 ·/ })).toBeDefined()
     await ui.unmount()
   })
 })

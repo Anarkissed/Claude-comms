@@ -120,7 +120,7 @@ For a reviewer that writes files itself, such as a Chat agent with file access:
 
 ## Development
 
-- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (147 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
-- **Web:** `cd web && python3 -m unittest -v test_web` (47 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
+- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (160 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
+- **Web:** `cd web && python3 -m unittest -v test_web` (50 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
 
 Forks and pull requests are welcome. Released under the [MIT License](LICENSE).
