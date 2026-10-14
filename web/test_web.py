@@ -624,6 +624,30 @@ class FourthReviewTests(World):
         self.assertEqual(self.on_hold(), [])
 
 
+    def test_a_failed_note_never_rolls_back_a_record_another_desk_finished(self):
+        m = self.seed("358", "reviewer", "358", "finished elsewhere", hexid="r5a001")
+        def note_fails_while_the_pane_finishes(*args):
+            core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": core.iso_now(), "told": ["reviewer", "358"]}) + "\n", replace=True)
+            raise OSError(28, "No space left on device")
+        self.folder._note = note_fails_while_the_pane_finishes
+        with self.assertRaises(OSError):
+            self.folder.hold("358", m["id"])
+        with open(self.held_path(m["id"])) as h:
+            record = json.loads(h.read())
+        self.assertEqual(record["told"], ["reviewer", "358"])
+        self.assertNotIn("failed", record)
+
+    def test_a_hold_declined_from_the_pane_while_its_notes_go_out_promises_the_agent_nothing(self):
+        m = self.seed("358", "reviewer", "358", "declined meanwhile", hexid="r5a002")
+        real_note = self.folder._note
+        def note_then_the_pane_declines(*args):
+            real_note(*args)
+            core.write_atomic(self.folder.channel_dir("358", "declined"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": core.iso_now(), "reason": "no"}) + "\n", replace=True)
+        self.folder._note = note_then_the_pane_declines
+        self.assertIn("declined meanwhile", self.folder.hold("358", m["id"]))
+        self.assertEqual([n for n in self.on_hold() if n["to"] == "358"], [])
+
+
 class NoHardLinkTests(World):
     def test_a_drive_without_hard_links_still_writes_atomically_and_never_clobbers(self):
         real_link = os.link

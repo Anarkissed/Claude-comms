@@ -190,77 +190,102 @@ const FIND_WRITES = /^-(delete|rm|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/
  * (...) and @(...)) and no backquote. Best effort, like the rest of the shell check.
  */
 /**
- * The command with quoted text blanked to spaces (same length): single-quoted text is literal in bash, zsh
- * and PowerShell; double-quoted text too, except `$(`…`)` and backquotes, which are kept so they still count.
+ * The command read as a shell reads it. `text` has quoted text and comments blanked to spaces (same
+ * length), except `$(`, `(` and backquotes inside double quotes, which are kept so they still count;
+ * `code` is the command with only its comments blanked. `escapes`: a backslash escapes the next
+ * character (bash, zsh) or is a plain character (PowerShell, cmd), so a command is judged both ways.
+ * `open`: a quote never closed. `ambiguous`: a spelling shells read differently ($$'…', PowerShell's <#).
  */
-const blankQuoted = (command: string): { text: string; open: boolean } => {
-  let out = ''
+const lex = (command: string, escapes: boolean): { text: string; code: string; open: boolean; ambiguous: boolean } => {
+  let text = ''
+  let code = ''
   let quote: '' | "'" | '"' | '$' = ''
+  let wordStart = true
+  let ambiguous = false
+  const put = (t: string, c: string) => {
+    text += t
+    code += c
+  }
   for (let i = 0; i < command.length; i += 1) {
     const ch = command[i] ?? ''
     const next = command[i + 1] ?? ''
     if (quote === '') {
-      if (ch === '\\') {
-        // an escaped character is literal (a line continuation is nothing at all)
-        out += next === '\n' ? '  ' : `\\${next === '' ? '' : ' '}`
+      if (ch === '\\' && escapes) {
+        if (next === '\n') {
+          // a line continuation joins the lines: the word it was in goes on
+          put('  ', '  ')
+        } else {
+          // an escaped character is literal, and part of a word
+          put(next === '' ? '\\' : '\\ ', `\\${next}`)
+          wordStart = false
+        }
         i += 1
-      } else if (ch === '#' && (i === 0 || /[\s;&|()<>]/.test(command[i - 1] ?? ''))) {
+      } else if (ch === '#' && wordStart) {
         // a comment (a # that starts a word) runs to the end of the line
         while (i < command.length && command[i] !== '\n') {
-          out += ' '
+          put(' ', ' ')
           i += 1
         }
-        if (i < command.length) out += '\n'
-      } else if (ch === '$' && next === "'") {
+        if (i < command.length) put('\n', '\n')
+        wordStart = true
+      } else if (ch === '$' && next === "'" && escapes) {
+        // $'…' (ANSI-C quoting); after another $ ($$'…') bash reads the PID and a plain '…', zsh does not
+        if (command[i - 1] === '$') ambiguous = true
         quote = '$'
-        out += "$'"
+        put("$'", "$'")
+        wordStart = false
         i += 1
       } else {
+        if (ch === '<' && next === '#') ambiguous = true
         if (ch === "'" || ch === '"') quote = ch
-        out += ch
+        put(ch, ch)
+        wordStart = /[\s;&|()<>]/.test(ch)
       }
     } else if (quote === '$') {
       // $'…': backslash escapes, ended by an unescaped '
       if (ch === '\\') {
-        out += '  '
+        put('  ', `${ch}${next}`)
         i += 1
       } else if (ch === "'") {
         quote = ''
-        out += ch
-      } else out += ' '
+        put(ch, ch)
+      } else put(' ', ch)
     } else if (ch === quote) {
       quote = ''
-      out += ch
-    } else if (quote === '"' && ch === '\\') {
-      out += '  '
+      put(ch, ch)
+    } else if (quote === '"' && ch === '\\' && escapes) {
+      put('  ', `${ch}${next}`)
       i += 1
     } else if (quote === '"' && (ch === '`' || (ch === '$' && next === '(') || (ch === '(' && command[i - 1] === '$'))) {
-      out += ch
+      put(ch, ch)
     } else {
-      out += ' '
+      put(' ', ch)
     }
   }
 
-  return { text: out, open: quote !== '' }
+  return { text, code: code.slice(0, command.length), open: quote !== '', ambiguous }
 }
 
 /** git options before the subcommand that change nothing about what runs. */
 const HARMLESS_GIT_GLOBALS = new Set(['--no-pager', '-P', '--no-optional-locks', '--literal-pathspecs', '--no-replace-objects'])
 
-export const isReadOnlyCommand = (command: string): boolean => {
-  const lexed = blankQuoted(command)
-  // a quote left open: the shell would not run this as written, and nothing after it can be judged
-  if (lexed.open) return false
+export const isReadOnlyCommand = (command: string): boolean => [true, false].every(escapes => isReadOnlyAs(command, escapes))
+
+const isReadOnlyAs = (command: string, escapes: boolean): boolean => {
+  const lexed = lex(command, escapes)
+  // a quote left open, or a spelling shells disagree on: nothing after it can be judged
+  if (lexed.open || lexed.ambiguous) return false
   const bare = lexed.text
   if (/[`()]|>(?!\s*&?\s*(1|2|\/dev\/null)\b)|\btee\b/.test(bare)) return false
-  // split where the shell would, found on the quote-blanked text (a ; inside quotes is not a separator)
+  // split where the shell would, found on the quote-blanked text (a ; inside quotes is not a separator),
+  // each part cut from the command with its comments taken out
   const parts: string[] = []
   let from = 0
   for (const sep of bare.matchAll(/;|&&|\|\||\|&?|(?<![<>])&(?!>)|\r|\n/g)) {
-    parts.push(command.slice(from, sep.index))
+    parts.push(lexed.code.slice(from, sep.index))
     from = (sep.index ?? 0) + sep[0].length
   }
-  parts.push(command.slice(from))
+  parts.push(lexed.code.slice(from))
   for (let i = parts.length - 1; i >= 0; i -= 1) {
     parts[i] = (parts[i] ?? '').trim()
     if (parts[i] === '') parts.splice(i, 1)

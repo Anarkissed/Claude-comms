@@ -336,12 +336,21 @@ const recheckDeliveries = async ($: Engine) => {
     if (b.type === 'tool_result') return typeof b.content === 'string' ? [b.content] : Array.isArray(b.content) ? b.content.flatMap(textOf) : []
     return []
   }
-  const text = rows.flatMap(row => (Array.isArray(row.content) ? row.content : []).flatMap(textOf)).join('\n')
+  // A delivery is found by its own header line ("… on channel #<ch> … (id <id>)."), in a row of the person's
+  // side (deliveries and tool results), with every message body taken out first: a body, or the model's own
+  // words, that quote an id do not count.
+  const text = rows
+    .filter(row => (row as { role?: unknown }).role !== 'assistant')
+    .flatMap(row => (Array.isArray(row.content) ? row.content : []).flatMap(textOf))
+    .join('\n')
+    .replace(/^----- message body ([0-9a-f]+) -----$[\s\S]*?^----- end of message \1 -----$/gm, '')
+  const found = new Set<string>()
+  for (const header of text.matchAll(/^\[agent-comms\] Message on channel #(\S+) from .*\(id ([^()\s]+)\)\.$/gm)) found.add(`${header[1]}/${header[2]}`)
   // A rewind removes the END of the conversation, so only deliveries after the last one still found are
   // lost. (The api form keeps the newest 4096 rows of a longer conversation: its START may be missing.)
   let lastFound = -1
   list.forEach((r, i) => {
-    if (text.includes(`(id ${r.id})`)) lastFound = i
+    if (found.has(`${r.ch}/${r.id}`)) lastFound = i
   })
   if (lastFound < 0) {
     const plain = await $.session.messages().catch(() => undefined)
@@ -1427,6 +1436,20 @@ const heldTime = async ($: Engine, ch: string, id: string): Promise<number | und
 const formatHeld = (id: string, ts: string, told: readonly string[], failed = false, claim?: string): string =>
   `${JSON.stringify({ id, by: MAINTAINER, ts, told, ...(failed ? { failed: true } : {}), ...(claim !== undefined ? { claim } : {}) })}\n`
 
+/** How long a desk finishing someone's unfinished hold waits after claiming it, before checking the claim. */
+const HOLD_CLAIM_SETTLE_MS = 200
+
+/** A hold record's "told" list, as written. */
+const readHeldRecord = async ($: Engine, ch: string, id: string): Promise<{ told: string[] } | undefined> => {
+  const text = await $.fs.read(`${paths.held(ch)}/${id}.json`).catch(() => undefined)
+  try {
+    const value = (typeof text === 'string' ? JSON.parse(text) : undefined) as { told?: unknown } | undefined
+    return Array.isArray(value?.told) ? { told: value.told.filter((x): x is string => typeof x === 'string') } : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** A hold record's "failed" flag (its last note could not be written) and "claim" token. */
 const heldMarks = async ($: Engine, ch: string, id: string): Promise<{ failed: boolean; claim?: string }> => {
   const text = await $.fs.read(`${paths.held(ch)}/${id}.json`).catch(() => undefined)
@@ -1509,10 +1532,15 @@ const MAX_PIECE = 2000
  * Intl.Segmenter is missing. A cluster longer than any real one (a pile of combining marks) is taken
  * apart into its code points, so a piece of a wrapped line stays short.
  */
+type Segmenter = { segment: (s: string) => Iterable<{ segment: string }> }
+let segmenter: Segmenter | null | undefined
 const graphemes = (line: string): string[] => {
-  const Segmenter = (Intl as unknown as { Segmenter?: new (l?: string, o?: { granularity: string }) => { segment: (s: string) => Iterable<{ segment: string }> } }).Segmenter
-  if (Segmenter === undefined) return Array.from(line)
-  return Array.from(new Segmenter(undefined, { granularity: 'grapheme' }).segment(line), s => s.segment).flatMap(c => (c.length > 64 ? Array.from(c) : [c]))
+  if (segmenter === undefined) {
+    const make = (Intl as unknown as { Segmenter?: new (l?: string, o?: { granularity: string }) => Segmenter }).Segmenter
+    segmenter = make === undefined ? null : new make(undefined, { granularity: 'grapheme' })
+  }
+  if (segmenter === null) return Array.from(line)
+  return Array.from(segmenter.segment(line), s => s.segment).flatMap(c => (c.length > 64 ? Array.from(c) : [c]))
 }
 
 /** Terminal cells a grapheme cluster takes: an emoji (presentation, or pictograph + VS16) 2, else the sum of its characters. */
@@ -1611,9 +1639,15 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
       return
     }
     if (unfinished) {
-      // finishing it: claim it afresh first, so another desk reading it now sees a hold in progress
+      // finishing it: claim it afresh, so a desk reading it now sees a hold in progress, and go on only if
+      // the claim is still ours a moment later (the web desk waits as long)
       const claim = randomHex(6)
-      await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, told, false, claim), true)
+      const claimed = await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, told, false, claim), true)
+      if (!claimed.ok) {
+        await update($, infoAtom, () => `Not held: ${claimed.reason}`)
+        return
+      }
+      await $.clock.sleep(HOLD_CLAIM_SETTLE_MS)
       if ((await heldMarks($, ch, id)).claim !== claim) {
         await update($, infoAtom, () => 'That hold is being finished from another desk right now.')
         return
@@ -1641,11 +1675,20 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
       : `On hold: ${withArticle(m.kind)} from ${m.from} to you is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.`
   let failed: string | undefined
   for (const r of missing) {
+    // declined from another desk meanwhile: no promise of word is sent after it
+    if (await $.fs.exists(`${paths.declined(ch)}/${id}.json`).catch(() => false)) {
+      failed = 'it was declined meanwhile'
+      break
+    }
     const written = await postNote($, ch, r, noteFor(r))
     if (!written.ok) {
       failed = written.reason
-      // marked failed, so the next Hold (on this desk or the other) finishes it at once
-      await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, told, true), true)
+      // marked failed, so the next Hold (on this desk or the other) finishes it at once; unless another desk
+      // has moved the record on meanwhile, which then stands
+      const now = (await readHeldRecord($, ch, id))?.told
+      if (now !== undefined && now.length === told.length && now.every(x => told.includes(x))) {
+        await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, told, true), true)
+      }
       break
     }
     told = [...told, r]
@@ -1653,7 +1696,9 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
   }
   await update($, infoAtom, () =>
     failed !== undefined
-      ? `Hold note not written: ${failed}. Press Hold again to send it.`
+      ? failed === 'it was declined meanwhile'
+        ? 'Not held further: it was declined meanwhile.'
+        : `Hold note not written: ${failed}. Press Hold again to send it.`
       : m.to === ALL
       ? `On hold: the group #${ch} (${m.from} included) was told to expect a message soon.`
       : `On hold: ${m.from} and ${m.to} were told to expect a message soon.`)

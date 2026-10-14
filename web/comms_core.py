@@ -527,6 +527,9 @@ class Folder:
         if not missing:
             return f"Already on hold; {m['from']} and {agent_side} were told."
         for r in missing:
+            # declined from another desk meanwhile: no promise of word is sent after it
+            if os.path.exists(os.path.join(self.channel_dir(ch, "declined"), mid + ".json")):
+                return "Not held further: it was declined meanwhile."
             if r == ALL:
                 # the group is told something waits, never what it says (the text is not approved); "all" reaches the reviewer too
                 body = f"On hold: {with_article(m['kind'])} from {m['from']} to the group is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon."
@@ -537,9 +540,12 @@ class Folder:
             try:
                 self._note(ch, r, body)
             except OSError:
-                # marked failed, so the next Hold (here or in the pane) finishes it at once
+                # marked failed, so the next Hold (here or in the pane) finishes it at once; unless another
+                # desk has moved the record on meanwhile, which then stands
                 try:
-                    self._write_held(ch, mid, ts, told, replace=True, failed=True)
+                    now = self.held_records(ch).get(mid)
+                    if now is not None and sorted(now) == sorted(told):
+                        self._write_held(ch, mid, ts, told, replace=True, failed=True)
                 except OSError:
                     pass
                 raise

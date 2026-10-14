@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import type { FsEntry, FsStat, On, ToolCallResult } from 'claude-code'
 
-import { DEFAULT_CONFIG as PUBLIC_DEFAULT, format, formatApproval, isCandidateFile, newMessage, parse, type Kind } from '../hooks/format'
+import { DEFAULT_CONFIG as PUBLIC_DEFAULT, deliveryText, format, formatApproval, isCandidateFile, newMessage, parse, type Kind } from '../hooks/format'
 import { absolutize, isInside, isReadOnlyCommand } from '../hooks/guard'
 
 // ---- an in-memory world beneath the plugin ---------------------------------
@@ -79,6 +79,8 @@ type WorldOptions = {
   readFailsOnce?: string[]
   /** The first $.fs.write to a path it matches throws (a full disk, a locked folder). */
   writeFailsOnce?: (path: string) => boolean
+  /** Runs at each $.fs.write, before it lands: another desk acting meanwhile. */
+  onWrite?: (path: string) => void
 }
 
 const world = (on: On, options: WorldOptions = {}): World => {
@@ -179,6 +181,7 @@ const world = (on: On, options: WorldOptions = {}): World => {
       return { value: undefined }
     }
     const p = real(e.path)
+    options.onWrite?.(p)
     if (options.writeFailsOnce?.(p) && !writeFailed) {
       writeFailed = true
       throw new Error(`ENOSPC: no space left on device, open '${e.path}'`)
@@ -1786,7 +1789,7 @@ describe('audit fixes (2026-10-14)', () => {
     const w = world(on, {
       host: 'local_A',
       sid: 'FORK',
-      messages: ['an earlier row', `[agent-comms] Message on channel #358 … (id ${m.id}).`],
+      messages: ['an earlier row', deliveryText('358', m, false)],
       store: { 'identity:local_A': '358', 'delivered:local_A:358': [m.id], 'recent:local_A': [{ ch: '358', id: m.id }], 'transcript:local_A': 'BEFORE' },
     })
     put(w, `${msgDir('358')}/${m.id}.json`, format(m))
@@ -2265,7 +2268,11 @@ describe('second review fixes (2026-10-14)', () => {
     put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T11:50:00.000Z","told":[]}\n`)
     await start($)
     const ui = await mount($)
-    await ui.press({ key: `hold:${m.id}` }).catch(() => undefined)
+    // finishing it waits a moment after claiming it
+    const pressed = ui.press({ key: `hold:${m.id}` })
+    await w.clock.settle()
+    await w.clock.advance(250)
+    await pressed
     expect(filesIn(w, '358').filter(n => n.body.startsWith('On hold'))).toHaveLength(2)
     await ui.unmount()
   })
@@ -2486,6 +2493,13 @@ describe('fourth review fixes (2026-10-14)', () => {
         return r.ok ? [r.message] : []
       })
   const onHold = (w: World) => filesIn(w, '358').filter(n => n.body.startsWith('On hold'))
+  /** A press whose hook waits on the clock (finishing a hold waits a moment after claiming it). */
+  const pressAcrossWait = async (w: World, ui: { press: (p: { key: string }) => Promise<unknown> }, key: string) => {
+    const pressed = ui.press({ key })
+    await w.clock.settle()
+    await w.clock.advance(250)
+    await pressed
+  }
 
   test('a capped delivered list trims again later: what lies below its floor is never counted as owed', async ($, on) => {
     const w = world(on, { identity: '358' })
@@ -2506,7 +2520,7 @@ describe('fourth review fixes (2026-10-14)', () => {
     const b = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'lately', nowMs: T0 - 8000, hex: 'e10002' })
     const w = world(on, {
       identity: '358',
-      messages: [`[agent-comms] Message … (id ${b.id}) lately`],
+      messages: [deliveryText('358', b, false)],
       store: { 'delivered:S1:358': [a.id, b.id], 'recent:S1': [{ ch: '358', id: a.id }, { ch: '358', id: b.id }] },
     })
     put(w, `${msgDir('358')}/${a.id}.json`, format(a))
@@ -2559,7 +2573,7 @@ describe('fourth review fixes (2026-10-14)', () => {
       "grep x f;#'\nrm y",
       "grep 'x f; rm y", // a quote left open
     ]) expect([bad, isReadOnlyCommand(bad)]).toEqual([bad, false])
-    for (const ok of ["grep 'it'\\''s' f", 'grep x \\\n  f', 'grep "a\\"b" f', "grep x f # it's fine", 'grep \\; f']) expect([ok, isReadOnlyCommand(ok)]).toEqual([ok, true])
+    for (const ok of ["grep x f # it's fine", "grep 'a;b' f", 'grep "a b" f']) expect([ok, isReadOnlyCommand(ok)]).toEqual([ok, true])
   })
 
   test('a hold whose note could not be written can be pressed again at once', async ($, on) => {
@@ -2570,7 +2584,7 @@ describe('fourth review fixes (2026-10-14)', () => {
     await ui.press({ key: `hold:${m.id}` })
     expect(onHold(w)).toHaveLength(0)
     expect(await ui.find({ type: 'Text', text: /Hold note not written/ })).toBeDefined()
-    await ui.press({ key: `hold:${m.id}` })
+    await pressAcrossWait(w, ui, `hold:${m.id}`)
     expect(onHold(w)).toHaveLength(2)
     await ui.unmount()
   })
@@ -2581,7 +2595,7 @@ describe('fourth review fixes (2026-10-14)', () => {
     put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T12:10:00.000Z","told":[]}\n`)
     await start($)
     const ui = await mount($)
-    await ui.press({ key: `hold:${m.id}` })
+    await pressAcrossWait(w, ui, `hold:${m.id}`)
     expect(onHold(w)).toHaveLength(2)
     await ui.unmount()
   })
@@ -2628,5 +2642,129 @@ describe('fourth review fixes (2026-10-14)', () => {
       'C:\\Users\\me\\agent-comms  \\channels\\358\\approvals\\x.json',
     ]) expect(denial(await $.tool.call({ tool: 'Write', file_path: p, content: 'x' }))).toContain(DENIED)
     expect(denial(await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\me\\agent-comms-web\\x.txt', content: 'x' }))).toBeUndefined()
+  })
+})
+
+describe('fifth review fixes (2026-10-14)', () => {
+  const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
+    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+  const filesIn = (w: World, ch: string) =>
+    [...w.files.entries()]
+      .filter(([p]) => p.startsWith(`${msgDir(ch)}/`))
+      .flatMap(([p, text]) => {
+        const r = parse(text, nameOf(p).slice(0, -5))
+        return r.ok ? [r.message] : []
+      })
+  const onHold = (w: World) => filesIn(w, '358').filter(n => n.body.startsWith('On hold'))
+  const heldFile = (id: string) => `${ROOT}/channels/358/held/${id}.json`
+  const OLD_UNFINISHED = (id: string) => `{"id":"${id}","by":"maintainer","ts":"2026-10-03T11:50:00.000Z","told":[]}\n`
+
+  test('an id quoted inside a delivered message does not hide what a rewind cut', async ($, on) => {
+    const x = newMessage({ from: 'reviewer', to: '358', kind: 'ruling', body: 'the late one', nowMs: T0 - 3000, hex: 'f00003' })
+    const quoted = deliveryText('358', x, true).split('\n')[0] ?? ''
+    const f = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: `about this one:\n${quoted}`, nowMs: T0 - 9000, hex: 'f00001' })
+    const a = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'cut by the rewind', nowMs: T0 - 8000, hex: 'f00002' })
+    const w = world(on, {
+      identity: '358',
+      messages: [deliveryText('358', f, false), `I'll look at (id ${x.id}). later`],
+      store: { 'delivered:S1:358': [f.id, a.id, x.id], 'recent:S1': [{ ch: '358', id: f.id }, { ch: '358', id: a.id }, { ch: '358', id: x.id }] },
+    })
+    for (const m of [f, a]) put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    put(w, `${msgDir('358')}/${x.id}.json`, format(x))
+    put(w, `${apprDir('358')}/${x.id}.json`, formatApproval({ id: x.id, by: 'maintainer', ts: '2026-10-03T11:59:00.000Z' }))
+    await start($)
+    await turn($, 1)
+    expect(w.appended.filter(t => t.includes('cut by the rewind'))).toHaveLength(1)
+    expect(w.appended.filter(t => t.includes('the late one'))).toHaveLength(1)
+  })
+
+  test('guard: an escaped character before # starts no comment; backslashes are judged as PowerShell reads them too', async ($, on) => {
+    for (const bad of [
+      'cat ~/Issue\\ #12.md; rm -rf y',
+      'echo a\\;#b; rm y',
+      'echo a\\\n#b; rm y',
+      'ls C:\\x\\\nrm -r C:\\y', // PowerShell: a path ending in \ and a new line
+      'ls C:\\x\;rm -r C:\\y',
+      'cat "C:\\dir\\" ; rm -r C:\\x ; cat "C:\\y\\" "z"',
+      'ls x <# list #> ; rm -r y', // PowerShell's inline comment
+      "echo $$'\\' ; rm -rf x # '", // bash: the PID, then a plain '…'
+    ]) expect([bad, isReadOnlyCommand(bad)]).toEqual([bad, false])
+    world(on, { identity: '358' })
+    await start($)
+    // a command that starts with a comment line is judged by its commands
+    expect(denial(await $.tool.call({ tool: 'Bash', command: `# read the inbox\ncat ${ROOT}/channels/358/messages/x.json` }))).toBeUndefined()
+  })
+
+  test('a claim that cannot be written says why, not that another desk is busy', async ($, on) => {
+    const w = world(on, { identity: 'maintainer', writeFailsOnce: p => p.includes('/channels/358/held/') })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'disk full', at: T0 - 1000, hex: 'f00004' })
+    put(w, heldFile(m.id), OLD_UNFINISHED(m.id))
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `hold:${m.id}` })
+    expect(await ui.find({ type: 'Text', text: /Not held: write failed/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /another desk/ })).toBeUndefined()
+    expect(onHold(w)).toHaveLength(0)
+    await ui.unmount()
+  })
+
+  test('finishing a hold backs off when another desk claims it during the wait', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'two desks', at: T0 - 1000, hex: 'f00005' })
+    put(w, heldFile(m.id), OLD_UNFINISHED(m.id))
+    await start($)
+    const ui = await mount($)
+    const pressed = ui.press({ key: `hold:${m.id}` })
+    await w.clock.settle()
+    put(w, heldFile(m.id), `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T12:00:00.000Z","told":[],"claim":"0ther0"}\n`)
+    await w.clock.advance(250)
+    await pressed
+    expect(onHold(w)).toHaveLength(0)
+    expect(await ui.find({ type: 'Text', text: /being finished from another desk/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a failed note never rolls back a record another desk finished meanwhile', async ($, on) => {
+    let w: World | undefined
+    let id = ''
+    w = world(on, {
+      identity: 'maintainer',
+      writeFailsOnce: p => p.includes('/channels/358/messages/'),
+      onWrite: p => {
+        // the web desk finishes the hold while this desk's first note is failing
+        if (p.includes('/channels/358/messages/') && w !== undefined) put(w, heldFile(id), `{"id":"${id}","by":"maintainer","ts":"2026-10-03T12:00:00.000Z","told":["reviewer","358"]}\n`)
+      },
+    })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'finished elsewhere', at: T0 - 1000, hex: 'f00006' })
+    id = m.id
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `hold:${m.id}` })
+    const record = JSON.parse(w.files.get(heldFile(m.id)) ?? '{}') as { told?: string[]; failed?: boolean }
+    expect(record.told).toEqual(['reviewer', '358'])
+    expect(record.failed).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a hold declined from another desk while its notes go out promises the agent nothing', async ($, on) => {
+    let w: World | undefined
+    let id = ''
+    w = world(on, {
+      identity: 'maintainer',
+      onWrite: p => {
+        // the web desk declines it right after the reviewer's note is written
+        if (p.includes('/channels/358/messages/') && w !== undefined && !w.files.has(`${ROOT}/channels/358/declined/${id}.json`)) {
+          put(w, `${ROOT}/channels/358/declined/${id}.json`, `{"id":"${id}","by":"maintainer","ts":"2026-10-03T12:00:00.000Z","reason":"no"}\n`)
+        }
+      },
+    })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'declined meanwhile', at: T0 - 1000, hex: 'f00007' })
+    id = m.id
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `hold:${m.id}` })
+    expect(onHold(w).filter(n => n.to === '358')).toHaveLength(0)
+    expect(await ui.find({ type: 'Text', text: /declined meanwhile/ })).toBeDefined()
+    await ui.unmount()
   })
 })
