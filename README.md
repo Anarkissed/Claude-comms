@@ -13,7 +13,7 @@ Run several Claude Code agents on one project, have a reviewer (another Claude s
 ## What you get
 
 - **A channel per agent** with the reviewer, plus **group chats** (several agents and the reviewer, with "to everyone"), plus **#direct**: just you and the reviewer.
-- **Your approval gate:** a reviewer message reaches an agent only after you approve it. You can also **Hold** it (both sides are told to expect word from you) or **Decline** it with a reason (it's never delivered, and only the reviewer is told why; the agent never hears of it).
+- **Your approval gate:** a reviewer message reaches an agent only after you approve it. You can also **Hold** it (both sides are told to expect word from you) or **Decline** it with a reason (it's never delivered and only the reviewer is told why; the agent hears nothing, unless you had put it on hold, in which case it's told only that nothing is coming).
 - **Agents act on messages by themselves:** when a message reaches an idle agent session, the mod starts a turn there, so the agent reads it and gets to work. A busy agent gets it at its next step and is never interrupted.
 - **The reviewer, your choice:** a **Claude Code session** (woken by every message sent to it) or a **Chat agent** that reads the folder on its own schedule.
 - **Model tools** `comms_read` and `comms_post`, and a write guard: agents can't create, change or delete files in the comms folder except through `comms_post`, so they can't approve their own messages. (It's a process guard against mistakes, not a security boundary.)
@@ -90,6 +90,7 @@ For a reviewer that writes files itself, such as a Chat agent with file access:
   channels/<channel>/messages/<UTC ISO time with ":" as "-">-<from>-<6 hex>.json
   channels/<channel>/approvals/<message id>.json     {"id", "by": "maintainer", "ts"}
   channels/<channel>/declined/<message id>.json      {"id", "by": "maintainer", "ts", "reason"}
+  channels/<channel>/held/<message id>.json          {"id", "by": "maintainer", "ts"}   (on hold; shared by the pane and the web desk)
 ```
 
 ```json
@@ -119,7 +120,7 @@ For a reviewer that writes files itself, such as a Chat agent with file access:
 
 ## Development
 
-- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (72 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
-- **Web:** `cd web && python3 -m unittest -v test_web` (29 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
+- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (122 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
+- **Web:** `cd web && python3 -m unittest -v test_web` (43 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
 
 Forks and pull requests are welcome. Released under the [MIT License](LICENSE).

@@ -322,9 +322,12 @@ class GroupTests(World):
         notes = [m for m in self.messages("team") if m["from"] == "maintainer" and m["body"].startswith("On hold")]
         self.assertEqual([(n["to"]) for n in notes], ["all"])  # ONE note to the group
         self.assertIn("to the group", notes[0]["body"])
+        self.assertNotIn("Freeze the API", notes[0]["body"])  # the group never sees unapproved text
         self.folder.decline("team", waiting["id"], "Not yet.")
         declines = [m for m in self.messages("team") if m["from"] == "maintainer" and m["body"].startswith("Declined")]
-        self.assertEqual([n["to"] for n in declines], ["reviewer"])  # no agent in the group is told
+        # it was on hold, so the group was promised word: it is told only that nothing is coming
+        self.assertEqual([n["to"] for n in declines], ["reviewer", "all"])
+        self.assertNotIn("Not yet", declines[1]["body"])
 
     def test_create_group_over_http(self):
         token = "k"
@@ -411,6 +414,71 @@ class ReviewerModeAndDirectTests(World):
         self.assertFalse(item["pending"])
         self.assertTrue(self.folder.post("direct", "358", "note", "x").startswith("Not sent"))
 
+
+
+class AuditFixTests(World):
+    """The 2026-10-14 audit, on the web desk's side of the shared folder."""
+
+    def test_hold_is_a_shared_file_and_decline_after_hold_tells_the_agent_nothing_is_coming(self):
+        m = self.seed("358", "reviewer", "358", "Rewrite it all.", hexid="aud001")
+        self.folder.hold("358", m["id"])
+        self.assertTrue(os.path.exists(os.path.join(self.folder.channel_dir("358", "held"), m["id"] + ".json")))
+        self.assertTrue(self.folder.hold("358", m["id"]).startswith("Already on hold"))
+        self.folder.decline("358", m["id"], "Too risky now.")
+        to_agent = [n["body"] for n in self.messages("358") if n["from"] == "maintainer" and n["to"] == "358"]
+        self.assertEqual(to_agent[-1], "Declined: the ruling from reviewer that was on hold was declined. Nothing is coming; carry on with your work.")
+        self.assertFalse(any("Too risky" in b or "Rewrite" in b for b in to_agent))
+
+    def test_a_hold_made_in_the_plugins_pane_counts_here(self):
+        m = self.seed("358", "reviewer", "358", "held in the pane", hexid="aud002")
+        core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": "2026-10-08T12:00:01.000Z"}) + "\n")
+        self.assertTrue(next(x for x in self.thread("358") if x["id"] == m["id"])["held"])
+        self.assertTrue(self.folder.hold("358", m["id"]).startswith("Already on hold"))
+        self.assertIn("nothing is coming", self.folder.decline("358", m["id"], "no"))
+
+    def test_approve_replaces_a_half_written_approval_file(self):
+        m = self.seed("358", "reviewer", "358", "half approved", hexid="aud003")
+        d = self.folder.channel_dir("358", "approvals")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, m["id"] + ".json"), "w") as h:
+            h.write('{"id":"')
+        self.assertTrue(self.folder.approve("358", m["id"]).startswith("✓ Approved"))
+        self.assertFalse(next(x for x in self.thread("358") if x["id"] == m["id"])["pending"])
+
+    def test_a_future_dated_message_does_not_hide_later_ones_from_the_new_marks(self):
+        self.seed("358", "reviewer", "maintainer", "from the future", kind="note", hexid="aud004", ts="2026-10-08T15:00:00.000Z")
+        self.folder.mark_seen("358")
+        later = self.seed("358", "reviewer", "maintainer", "urgent", kind="question", hexid="aud005", ts="2026-10-08T12:01:00.000Z")
+        self.assertTrue(next(x for x in self.thread("358") if x["id"] == later["id"])["fresh"])
+
+    def test_ids_and_times_are_checked_exactly_as_the_plugin_does(self):
+        self.assertFalse(core.is_id("358\n"))
+        self.assertFalse(core.is_ts("2026-10-08T12:00:00.000Z\n"))
+        self.assertFalse(core.is_ts("2026-13-45T12:00:00.000Z"))
+        self.assertFalse(core.is_ts("２０２６-10-08T12:00:00.000Z"))
+        self.assertTrue(core.is_ts("2026-10-08T12:00:00.000Z"))
+
+    def test_reserved_names_in_any_case_are_not_groups_or_agents(self):
+        self.assertFalse(core.is_group_id("ALL"))
+        self.assertFalse(core.is_group_id("Maintainer"))
+        self.assertIn("Not agent ids", self.folder.create_group("team", ["354", "Maintainer"]))
+
+    def test_named_reviewers_who_wrote_get_a_reply_box(self):
+        self.seed("358", "Reviewer3", "maintainer", "ok?", kind="question", hexid="aud006")
+        row = next(c for c in self.folder.snapshot()["channels"] if c["id"] == "358")
+        self.assertIn("Reviewer3", row["reviewers"])
+
+
+class SurrogateServerTests(ServerTests):
+    def test_half_an_emoji_in_a_file_does_not_break_the_page(self):
+        d = self.folder.channel_dir("358", "messages")
+        stem = "2026-10-08T12-00-00.000Z-reviewer-aud007"
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, stem + ".json"), "w") as h:
+            h.write('{"v":1,"id":"%s","from":"reviewer","to":"358","kind":"note","ts":"2026-10-08T12:00:00.000Z","body":"cut \\ud83d"}\n' % stem)
+        status, data = self.request("GET", "/api/state", headers={"X-Comms-Token": self.token})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(data)["ok"])
 
 
 class NoHardLinkTests(World):

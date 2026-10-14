@@ -45,7 +45,7 @@ import qr  # noqa: E402
 
 MAX_BODY = 1_000_000
 # Bumped with every change to the page/server pair; the page compares it and asks for a restart when they differ.
-SERVER_VERSION = "2026-10-12.1"
+SERVER_VERSION = "2026-10-14.1"
 CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # no 0/O, 1/I: easy to type on a phone
 MAX_PAIR_FAILURES = 5
 COOKIE = "comms_session"
@@ -192,7 +192,8 @@ def make_handler(folder: core.Folder, token: str, port_box: Dict[str, int], lan:
             self.wfile.write(body)
 
         def _json(self, status: int, value: Any, extra: Optional[Dict[str, str]] = None) -> None:
-            self._send(status, json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", extra)
+            # ASCII escapes: a lone surrogate read from a file (half an emoji) cannot make the encode fail
+            self._send(status, json.dumps(value, ensure_ascii=True).encode("ascii"), "application/json; charset=utf-8", extra)
 
         def _read_json(self) -> Optional[Dict[str, Any]]:
             if (self.headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":

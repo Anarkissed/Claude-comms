@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -17,8 +18,9 @@ ALL = "all"  # `to` for a group message: every member but its sender
 DIRECT = "direct"  # the maintainer and the reviewer alone
 MAINTAINER = "maintainer"
 SETUP_MARKER = "[agent-comms setup]"
-ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,32}\Z")
+TS_RE = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z\Z")
+SEEN_CAP = 1000
 
 
 def is_id(value: Any) -> bool:
@@ -26,7 +28,13 @@ def is_id(value: Any) -> bool:
 
 
 def is_ts(value: Any) -> bool:
-    return isinstance(value, str) and bool(TS_RE.match(value))
+    if not isinstance(value, str) or not TS_RE.match(value):
+        return False
+    try:  # a real date, as the plugin's Date.parse check
+        datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+        return True
+    except ValueError:
+        return False
 
 
 def is_reviewer(i: str) -> bool:
@@ -52,8 +60,13 @@ def is_group(channel: Dict[str, Any]) -> bool:
     return len(agents_of(channel)) > 1
 
 
+def is_reserved_id(i: str) -> bool:
+    """Names no agent or group may take, in any case (folders on macOS and Windows ignore case too)."""
+    return i.lower() in (ALL, MAINTAINER, "off") or is_reviewer(i)
+
+
 def is_group_id(i: str) -> bool:
-    return is_id(i) and not i.isdigit() and i not in (ALL, MAINTAINER) and not is_reviewer(i)
+    return is_id(i) and not i.isdigit() and not is_reserved_id(i)
 
 
 def belongs_to(m: Dict[str, Any], channel: Dict[str, Any]) -> bool:
@@ -157,6 +170,18 @@ def first_line(body: str, limit: int = 80) -> str:
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
+def seen_test(value: Any):
+    """Whether the maintainer saw an id: `value` is the ids marked when the channel was last opened
+    (an id older than the oldest kept counts as seen), or a legacy single id (ids at or before it)."""
+    if isinstance(value, str):
+        return lambda i: i <= value
+    ids = [i for i in value if isinstance(i, str)] if isinstance(value, list) else []
+    if not ids:
+        return lambda i: False
+    kept, oldest = set(ids), ids[0]
+    return lambda i: i in kept or (len(ids) >= SEEN_CAP and i < oldest)
+
+
 def write_atomic(directory: str, name: str, text: str, replace: bool = False) -> str:
     """A dot-named temp file in the same folder, fsynced, then a hard link to the
     final name (fails if it exists: never clobbers) or os.replace (state files)."""
@@ -211,15 +236,31 @@ class Folder:
     def save_state(self, state: Dict[str, Any]) -> None:
         write_atomic(os.path.dirname(self.state_path), os.path.basename(self.state_path), dumps(state) + "\n", replace=True)
 
+    def _config_text(self) -> Optional[str]:
+        """channels.json's text, read again (3 times, 150 ms apart) while it does not parse:
+        the plugin writes it in place, so a read can land in the middle of a write."""
+        text = None
+        for attempt in range(3):
+            try:
+                with open(os.path.join(self.root, "channels.json"), encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError:
+                return None
+            try:
+                json.loads(text)
+                return text
+            except ValueError:
+                if attempt < 2:
+                    time.sleep(0.15)
+        return text
+
     def config(self) -> Optional[Dict[str, Any]]:
-        try:
-            with open(os.path.join(self.root, "channels.json"), encoding="utf-8") as handle:
-                return parse_config(handle.read())
-        except OSError:
-            return None
+        text = self._config_text()
+        return parse_config(text) if text is not None else None
 
     # ---- reading
-    def _records(self, ch: str, sub: str) -> Dict[str, Dict[str, Any]]:
+    def _records(self, ch: str, sub: str, unreadable: Optional[Set[str]] = None) -> Dict[str, Dict[str, Any]]:
+        """The records in channels/<ch>/<sub>/ that parse; the stems of those that do not go into `unreadable`."""
         out: Dict[str, Dict[str, Any]] = {}
         d = self.channel_dir(ch, sub)
         for name in os.listdir(d) if os.path.isdir(d) else []:
@@ -229,10 +270,17 @@ class Folder:
                 with open(os.path.join(d, name), encoding="utf-8") as handle:
                     record = parse_record(handle.read(), name[:-5])
             except (OSError, UnicodeDecodeError):
-                continue
+                record = None
             if record is not None:
                 out[name[:-5]] = record
+            elif unreadable is not None:
+                unreadable.add(name[:-5])
         return out
+
+    def held_ids(self, ch: str) -> Set[str]:
+        """Messages on hold: channels/<ch>/held/<id>.json, written by this desk or the plugin's pane."""
+        d = self.channel_dir(ch, "held")
+        return {name[:-5] for name in (os.listdir(d) if os.path.isdir(d) else []) if is_candidate(name)}
 
     def scan(self, channel: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int, bool, Set[str], Dict[str, str]]:
         d = self.channel_dir(channel["id"], "messages")
@@ -261,15 +309,21 @@ class Folder:
             return {"ok": False, "error": "channels.json is missing or unreadable: run /comms-setup in Claude Code first."}
         state = self.state()
         seen = state.get("seen", {})
-        held = set(state.get("held", []))
+        legacy_held = set(state.get("held", []))
         channels, threads = [], {}
         for channel in cfg["channels"]:
             messages, skipped, missing, approved, declined = self.scan(channel)
-            last_seen = seen.get(channel["id"], "")
+            is_seen = seen_test(seen.get(channel["id"]))
+            held = legacy_held | self.held_ids(channel["id"])
+            reviewers = reviewers_of(channel)
+            for m in messages:
+                for i in (m["from"], m["to"]):
+                    if is_reviewer(i) and member_of(channel, i) and i not in reviewers:
+                        reviewers.append(i)
             items, pending, unread = [], 0, 0
             for m in messages:
                 waiting = is_awaiting_approval(m, approved, set(declined), cfg["require_approval"])
-                fresh = m["from"] != MAINTAINER and m["id"] > last_seen
+                fresh = m["from"] != MAINTAINER and not is_seen(m["id"])
                 pending += waiting
                 unread += fresh
                 items.append({
@@ -285,7 +339,7 @@ class Folder:
             channels.append({
                 "id": channel["id"],
                 "agents": agents_of(channel),
-                "reviewers": reviewers_of(channel),
+                "reviewers": reviewers,
                 "group": is_group(channel),
                 "pending": pending,
                 "unread": unread,
@@ -321,41 +375,65 @@ class Folder:
         m = new_message(MAINTAINER, to, "note", body)
         write_atomic(self.channel_dir(ch, "messages"), m["id"] + ".json", format_message(m))
 
+    def _record_is_unreadable(self, ch: str, sub: str, mid: str) -> bool:
+        """An approval or decline file for `mid` exists but does not parse (half written, or not the maintainer's)."""
+        bad: Set[str] = set()
+        self._records(ch, sub, bad)
+        return mid in bad
+
     def approve(self, ch: str, mid: str) -> str:
         m, why = self._find_waiting(ch, mid)
         if m is None:
             return f"Not approved: {why}"
-        write_atomic(self.channel_dir(ch, "approvals"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": iso_now()}) + "\n")
+        # a file that does not parse is replaced by the maintainer's own record
+        replace = self._record_is_unreadable(ch, "approvals", mid)
+        try:
+            write_atomic(self.channel_dir(ch, "approvals"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": iso_now()}) + "\n", replace=replace)
+        except FileExistsError:
+            return "Already approved elsewhere a moment ago."
         return f"✓ Approved {m['from']}'s {m['kind']} to {m['to']}; it reaches {m['to']} at its next step."
 
     def hold(self, ch: str, mid: str) -> str:
         m, why = self._find_waiting(ch, mid)
         if m is None:
             return f"Not held: {why}"
-        state = self.state()
-        held = list(state.get("held", []))
-        if mid in held:
-            return f"Already on hold; {m['from']} and {m['to']} were told."
+        agent_side = "the group" if m["to"] == ALL else m["to"]
+        # the hold is a file the plugin's pane reads too: its first writer tells the others, the second tells no one twice
+        if mid in set(self.state().get("held", [])):
+            return f"Already on hold; {m['from']} and {agent_side} were told."
+        try:
+            write_atomic(self.channel_dir(ch, "held"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": iso_now()}) + "\n")
+        except FileExistsError:
+            return f"Already on hold; {m['from']} and {agent_side} were told."
         if m["to"] == ALL:
-            self._note(ch, ALL, f"On hold: {with_article(m['kind'])} from {m['from']} to the group (\"{first_line(m['body'])}\") is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.")
+            # the group is told something waits, never what it says (the text is not approved); "all" reaches the reviewer too
+            self._note(ch, ALL, f"On hold: {with_article(m['kind'])} from {m['from']} to the group is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.")
         else:
             self._note(ch, m["from"], f"On hold: your {m['kind']} to {m['to']} (\"{first_line(m['body'])}\") is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.")
             self._note(ch, m["to"], f"On hold: {with_article(m['kind'])} from {m['from']} to you is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.")
-        state["held"] = (held + [mid])[-500:]
-        self.save_state(state)
-        return f"⏸ On hold: {m['from']} and {m['to']} were told to expect a message soon."
+        return f"⏸ On hold: {m['from']} and {agent_side} were told to expect a message soon."
 
     def decline(self, ch: str, mid: str, reason: str) -> str:
+        """The reviewer always gets the reason. The agent (or the group) is told nothing, unless the
+        message was on hold: then it was promised word, and is told only that it was declined."""
         m, why = self._find_waiting(ch, mid)
         if m is None:
             return f"Not declined: {why}"
         reason = reason.strip()
-        write_atomic(self.channel_dir(ch, "declined"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": iso_now(), "reason": reason}) + "\n")
+        replace = self._record_is_unreadable(ch, "declined", mid)
+        try:
+            write_atomic(self.channel_dir(ch, "declined"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": iso_now(), "reason": reason}) + "\n", replace=replace)
+        except FileExistsError:
+            return "Already declined elsewhere a moment ago."
+        was_held = mid in self.held_ids(ch) or mid in set(self.state().get("held", []))
         line = f"Reason: {reason or '(no reason given)'}"
-        # only the reviewer who wrote it is told; the agent (or the group) never is
         to_whom = f"the group #{ch}" if m["to"] == ALL else m["to"]
-        untold = "the group was" if m["to"] == ALL else f"{m['to']} was"
-        self._note(ch, m["from"], f"Declined: your {m['kind']} to {to_whom} (\"{first_line(m['body'])}\") was not delivered, and {untold} not told.\n{line}")
+        agent_side = "the group" if m["to"] == ALL else m["to"]
+        if was_held:
+            self._note(ch, m["from"], f"Declined: your {m['kind']} to {to_whom} (\"{first_line(m['body'])}\") was not delivered. {agent_side} had been told it was on hold, and is now told only that it was declined and nothing is coming.\n{line}")
+            self._note(ch, m["to"], f"Declined: the {m['kind']} from {m['from']} that was on hold was declined. Nothing is coming; carry on with your work.")
+            return f"✗ Declined; {m['from']} was told why, and {agent_side} that nothing is coming."
+        self._note(ch, m["from"], f"Declined: your {m['kind']} to {to_whom} (\"{first_line(m['body'])}\") was not delivered, and {agent_side} was not told.\n{line}")
         return f"✗ Declined; only {m['from']} was told why."
 
     def post(self, ch: str, to: str, kind: str, text: str) -> str:
@@ -383,28 +461,23 @@ class Folder:
             return f'"{name}" can\'t be a group name: use letters, digits, - or _, not all digits.'
         if len(agents) < 2:
             return "A group needs at least two agents."
-        bad = [a for a in agents if not is_id(a) or a in (ALL, MAINTAINER) or is_reviewer(a)]
+        bad = [a for a in agents if not is_id(a) or is_reserved_id(a)]
         if bad:
             return f"Not agent ids: {', '.join(bad)}."
-        path = os.path.join(self.root, "channels.json")
-        for _ in range(3):
-            try:
-                with open(path, encoding="utf-8") as handle:
-                    text = handle.read()
-            except OSError:
-                return "The folder is not set up yet: run /comms-setup in Claude Code first."
-            cfg = parse_config(text)
-            raw = json.loads(text) if cfg is not None else None
-            if cfg is None or not isinstance(raw, dict):
-                return "channels.json is unreadable; it was left alone."
-            existing = next((c for c in cfg["channels"] if c["id"] == name), None)
+
+        def add(raw, cfg):
+            # channel folders on macOS and Windows ignore case: #Team and #team would share one
+            existing = next((c for c in cfg["channels"] if c["id"].lower() == name.lower()), None)
             if existing is not None:
-                if sorted(agents_of(existing)) == sorted(agents):
-                    break
-                return f"#{name} already exists with {', '.join(existing['members'])}; pick another name."
-            merged = dict(raw)
-            merged["channels"] = list(raw.get("channels", [])) + [{"id": name, "members": [REVIEWER] + agents}]
-            write_atomic(self.root, "channels.json", json.dumps(merged, indent=2, ensure_ascii=False) + "\n", replace=True)
+                if existing["id"] == name and sorted(agents_of(existing)) == sorted(agents):
+                    return "done"
+                return f"#{existing['id']} already exists with {', '.join(existing['members'])}; pick another name."
+            raw["channels"] = list(raw.get("channels", [])) + [{"id": name, "members": [REVIEWER] + agents}]
+            return None
+
+        why = self._change_config(add)
+        if why:
+            return why
         cfg = self.config()
         group = next((c for c in (cfg or {}).get("channels", []) if c["id"] == name), None)
         if group is None:
@@ -415,29 +488,51 @@ class Folder:
         if not any(m["from"] == MAINTAINER and m["body"].startswith(SETUP_MARKER) for m in messages):
             body = (
                 f"{SETUP_MARKER} Group #{name}: members {', '.join(group['members'])}.\n"
-                'In this group, "to": "all" reaches every member but the sender; "to": "<id>" reaches one member. Everyone in the group sees the whole thread.\n'
+                'In this group, "to": "all" reaches every member but the sender; "to": "<id>" reaches that member only. The maintainer and the reviewer see the whole thread.\n'
                 "A message from any reviewer reaches the agents only after the maintainer approves it. Agents post with comms_post and read with comms_read."
             )
             m = new_message(MAINTAINER, ALL, "note", body)
             write_atomic(self.channel_dir(name, "messages"), m["id"] + ".json", format_message(m))
         return f"Group #{name} is ready: {', '.join(group['members'])}."
 
+    def _change_config(self, change) -> Optional[str]:
+        """One change to channels.json (no lock exists between this desk and the plugin): read, let
+        `change(raw, cfg)` edit the dict (return None), say it is already there ("done") or refuse
+        (a reason); read again just before writing and start over if the file moved; write; then
+        the next pass reads it back and checks the change survived. None when the change is in."""
+        for attempt in range(4):
+            text = self._config_text()
+            if text is None:
+                return "channels.json is missing or unreadable: run /comms-setup in Claude Code first."
+            try:
+                raw = json.loads(text)
+            except ValueError:
+                raw = None
+            cfg = parse_config(text)
+            if cfg is None or not isinstance(raw, dict):
+                return "channels.json is unreadable; it was left alone."
+            why = change(raw, cfg)
+            if why == "done":
+                return None
+            if why:
+                return why
+            if attempt == 3:
+                break
+            if self._config_text() != text:
+                continue
+            write_atomic(self.root, "channels.json", json.dumps(raw, indent=2, ensure_ascii=False) + "\n", replace=True)
+        return "channels.json kept changing under this write; try again."
+
     def _update_config(self, change) -> Optional[str]:
-        """Re-reads channels.json, applies `change(raw)` (which edits the dict, or returns why not)
-        and writes it back atomically; every other field is kept. None when written."""
-        path = os.path.join(self.root, "channels.json")
-        try:
-            with open(path, encoding="utf-8") as handle:
-                raw = json.loads(handle.read())
-        except (OSError, ValueError):
-            return "channels.json is missing or unreadable: run /comms-setup in Claude Code first."
-        if not isinstance(raw, dict) or parse_config(json.dumps(raw)) is None:
-            return "channels.json is unreadable; it was left alone."
-        why = change(raw)
-        if why:
-            return why
-        write_atomic(self.root, "channels.json", json.dumps(raw, indent=2, ensure_ascii=False) + "\n", replace=True)
-        return None
+        """Sets a value in channels.json with `change(raw)` (edits the dict, or returns why not); every other field is kept."""
+        def apply(raw, cfg):
+            before = json.dumps(raw, sort_keys=True)
+            why = change(raw)
+            if why:
+                return why
+            return "done" if json.dumps(raw, sort_keys=True) == before else None
+
+        return self._change_config(apply)
 
     def set_reviewer_mode(self, mode: str) -> str:
         if mode not in ("code", "chat"):
@@ -483,6 +578,7 @@ class Folder:
             return
         state = self.state()
         seen = dict(state.get("seen", {}))
-        seen[ch] = messages[-1]["id"]
+        # every message now on the channel, by id (the newest SEEN_CAP): not one high-water id a misdated message could push past
+        seen[ch] = [m["id"] for m in messages][-SEEN_CAP:]
         state["seen"] = seen
         self.save_state(state)

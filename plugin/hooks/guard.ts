@@ -21,6 +21,8 @@ export const EXEMPT_TOOLS = new Set([
   'Agent',
   'Task',
   'SendMessage',
+  // a workflow's script orchestrates agents; each agent's own tool calls are checked one by one
+  'Workflow',
 ])
 
 /** Input keys holding a path the tool will touch. */
@@ -42,18 +44,29 @@ export const PATH_KEYS = new Set([
   'new_path',
 ])
 
+/**
+ * Other input keys that name a path a tool may write: any key ending in path,
+ * dir, directory, file, folder, dest, destination, target or output (out_dir,
+ * output_path, saveFile…), so a tool with its own key names is checked too.
+ */
+export const PATH_KEY_PATTERN = /(path|paths|dir|directory|file|folder|dest|destination|target|output)$/i
+
+/** Whether `key` holds a path to check: one of PATH_KEYS or a key matching PATH_KEY_PATTERN. */
+export const isPathKey = (key: string): boolean => PATH_KEYS.has(key) || PATH_KEY_PATTERN.test(key)
+
 /** Input keys holding a shell command. */
 export const COMMAND_KEYS = new Set(['command', 'cmd', 'script'])
 
 /** Skills / slash commands only the person runs. */
 export const PERSON_ONLY_COMMAND = /(^|[\s/:])comms(-as|-setup|-approve|-group)?(\s|$)/
 
-/** Strings under `keys` anywhere in `input` (arrays and nested objects walked). */
-export const stringsUnder = (input: unknown, keys: ReadonlySet<string>, depth = 0): string[] => {
+/** Strings under `keys` (a set, or a test on the key) anywhere in `input` (arrays and nested objects walked). */
+export const stringsUnder = (input: unknown, keys: ReadonlySet<string> | ((key: string) => boolean), depth = 0): string[] => {
   if (depth > 6 || typeof input !== 'object' || input === null) return []
   const found: string[] = []
+  const wanted = typeof keys === 'function' ? keys : (key: string) => keys.has(key)
   for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-    if (keys.has(key)) {
+    if (wanted(key)) {
       if (typeof value === 'string') found.push(value)
       if (Array.isArray(value)) for (const v of value) if (typeof v === 'string') found.push(v)
     }
@@ -66,7 +79,7 @@ export const stringsUnder = (input: unknown, keys: ReadonlySet<string>, depth = 
 /** Windows backslashes as forward slashes: every path here is compared in that one spelling. */
 export const toSlashes = (path: string): string => path.replace(/\\/g, '/')
 
-/** `/x` (macOS, Linux) or `C:/x` (Windows, after toSlashes). */
+/** `/x` (macOS, Linux), `C:/x` (Windows, after toSlashes) or `//server/share` (a Windows network path). */
 const isAbsolutePath = (path: string): boolean => path.startsWith('/') || /^[A-Za-z]:\//.test(path)
 
 /**
@@ -76,10 +89,20 @@ const isAbsolutePath = (path: string): boolean => path.startsWith('/') || /^[A-Z
 export const absolutize = (path: string, cwd: string, home: string): string => {
   const h = toSlashes(home)
   let p = toSlashes(path.trim())
+  // Windows' long-path forms: \\?\C:\x and \\?\UNC\server\share are C:/x and //server/share
+  p = p.replace(/^\/\/[?.]\/UNC\//i, '//').replace(/^\/\/[?.]\/(?=[A-Za-z]:)/, '')
   if (p === '~' || p.startsWith('~/')) p = h + p.slice(1)
   p = p.replace(/^(\$\{?HOME\}?|%USERPROFILE%|\$env:USERPROFILE)(?=\/|$)/i, h)
+  // a drive-relative path (C:x) is relative to that drive's current folder: the session's, when on the same drive
+  const driveRelative = /^([A-Za-z]:)(?!\/)(.*)$/.exec(p)
+  if (driveRelative) {
+    const c = toSlashes(cwd)
+    const sameDrive = c.slice(0, 2).toUpperCase() === (driveRelative[1] ?? '').toUpperCase()
+    p = `${sameDrive ? c.replace(/\/+$/, '') : `${driveRelative[1]}`}/${driveRelative[2] ?? ''}`
+  }
   if (!isAbsolutePath(p)) p = `${toSlashes(cwd).replace(/\/+$/, '')}/${p}`
-  let drive = ''
+  // a network path keeps its two leading slashes
+  let drive = /^\/\/[^/]/.test(p) ? '/' : ''
   const withDrive = /^([A-Za-z]:)(\/.*)?$/.exec(p)
   if (withDrive) {
     drive = (withDrive[1] ?? '').toUpperCase()
@@ -95,13 +118,43 @@ export const absolutize = (path: string, cwd: string, home: string): string => {
   return `${drive}/${out.join('/')}`
 }
 
-/** Whether `path` is `root` or under it; a Windows root (`C:/…`) compares without case, as its file system does. */
+/**
+ * Whether `path` is `root` or under it. Compared without case (macOS and
+ * Windows file systems ignore it by default, and a guard errs on the side of
+ * denying), and with macOS's `/System/Volumes/Data` spelling of the same path folded.
+ */
 export const isInside = (path: string, root: string): boolean => {
-  const fold = /^[A-Za-z]:\//.test(root) ? (s: string) => s.toLowerCase() : (s: string) => s
-  const p = fold(toSlashes(path))
-  const r = fold(toSlashes(root))
-
+  const fold = (s: string) => toSlashes(s).replace(/^\/System\/Volumes\/Data(?=\/)/i, '').toLowerCase()
+  const p = fold(path)
+  const r = fold(root)
   return p === r || p.startsWith(r.endsWith('/') ? r : `${r}/`)
+}
+
+/** Programs that only read: a shell command made only of these, with no redirection, never writes. */
+const READ_ONLY_PROGRAMS = new Set([
+  'cat', 'head', 'tail', 'less', 'more', 'ls', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'stat', 'file', 'jq',
+  'diff', 'cmp', 'du', 'tree', 'readlink', 'realpath', 'basename', 'dirname', 'sort', 'uniq', 'cut', 'nl',
+  'echo', 'printf', 'test', '[', 'true', 'pwd', 'shasum', 'md5', 'md5sum', 'sha256sum', 'plutil', 'xxd', 'od', 'hexdump',
+])
+/** git subcommands that only read. */
+const READ_ONLY_GIT = new Set(['log', 'show', 'status', 'diff', 'blame', 'grep', 'ls-files', 'rev-parse', 'branch', 'remote'])
+
+/**
+ * Whether a shell command only reads: every part (split on ; && || |) runs a
+ * read-only program, with no output redirection, no command substitution and
+ * no find action that writes. Best effort, like the rest of the shell check.
+ */
+export const isReadOnlyCommand = (command: string): boolean => {
+  if (/[`]|\$\(|>(?!\s*&?\s*(1|2|\/dev\/null)\b)|\btee\b/.test(command)) return false
+  const parts = command.split(/;|&&|\|\||\||\n/).map(part => part.trim()).filter(Boolean)
+  if (parts.length === 0) return false
+  return parts.every(part => {
+    const words = part.replace(/^(\w+=\S*\s+)+/, '').split(/\s+/)
+    const program = (words[0] ?? '').replace(/^.*\//, '')
+    if (program === 'git') return READ_ONLY_GIT.has(words.find((w, i) => i > 0 && !w.startsWith('-')) ?? '')
+    if (program === 'find') return !/\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/.test(part)
+    return READ_ONLY_PROGRAMS.has(program)
+  })
 }
 
 /** The spellings of the root a command may carry, longest first. */

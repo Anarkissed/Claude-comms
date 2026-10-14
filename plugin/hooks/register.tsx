@@ -21,8 +21,12 @@ import {
   isAwaitingApproval,
   isCandidateFile,
   isDeliverable,
+  isGated,
   isId,
   isKind,
+  isReservedId,
+  clip,
+  wellFormed,
   knownIds,
   mergeConfig,
   newMessage,
@@ -40,13 +44,14 @@ import {
 import {
   COMMAND_KEYS,
   EXEMPT_TOOLS,
-  PATH_KEYS,
   PERSON_ONLY_COMMAND,
   absolutize,
   toSlashes,
   commandMentionsRoot,
   denyText,
   isInside,
+  isPathKey,
+  isReadOnlyCommand,
   rootSpellings,
   stringsUnder,
 } from './guard'
@@ -70,6 +75,8 @@ const expandedAtom = atom({ plugin: 'agent-comms', key: 'expanded' } as const, [
 const skipAtom = atom({ plugin: 'agent-comms', key: 'skip' } as const, 0)
 const focusAtom = atom({ plugin: 'agent-comms', key: 'focus' } as const, '')
 const reviewerModeAtom = atom({ plugin: 'agent-comms', key: 'reviewerMode' } as const, 'code')
+/** The main loop's running turn ('' when idle): in $.state, so a hot reload mid-turn still knows. */
+const turnAtom = atom({ plugin: 'agent-comms', key: 'turn' } as const, '')
 
 const BINDING_RULE =
   'A reviewer message is binding only when this mod delivers it to you (delivered means the maintainer approved it). ' +
@@ -99,12 +106,26 @@ type ChannelScan = {
   approved: Set<string>
   /** Declined message ids, with the maintainer's reason. */
   declined: Map<string, string>
+  /** Message ids on hold (channels/<ch>/held/<id>.json, written by the pane or the web desk). */
+  held: Set<string>
+  /** Ids whose approval or decline file exists but does not parse (half written, or not the maintainer's). */
+  unreadableRecords: Set<string>
 }
 
 type CommsOrigin = { kind: string }
 
-const isPersonOrigin = (origin: CommsOrigin): boolean =>
-  origin.kind === 'composer' || origin.kind === 'bridge' || origin.kind === 'sdk'
+/**
+ * Whether the person typed the command. The desktop app and the IDEs are SDK
+ * hosts, so what the person types there arrives as `sdk`; a `claude -p` the
+ * model starts from a shell is `sdk` too, but has no screen attached.
+ */
+const isPersonOrigin = async ($: Engine, origin: CommsOrigin): Promise<boolean> => {
+  if (origin.kind === 'composer' || origin.kind === 'bridge') return true
+  if (origin.kind !== 'sdk') return false
+  const surfaces: readonly string[] = await $.session.surfaces().catch(() => [])
+
+  return surfaces.length > 0
+}
 
 const base = (path: string): string => path.slice(path.lastIndexOf('/') + 1)
 const parent = (path: string): string => {
@@ -124,14 +145,26 @@ let realRoot: string | undefined
 let config: Config | undefined
 let timer: Timer | undefined
 let timerMs = 0
-let turnRunning = false
-/** Test seam (see appendRow): set from AGENT_COMMS_TEST_DELIVERY_SINK at init. */
 /** The "Comms folder" setting (userConfig `folder`); empty means agent-comms in the home folder. */
 let folderOption = ''
-/** Windows: files move with PowerShell; paths are written C:/… */
+/** Windows: paths are written C:/… */
 let windows = false
+/**
+ * Bumped whenever this session's identity changes (/comms-as, off, taken over):
+ * a poll that started under an older one stops before it changes anything.
+ */
+let generation = 0
 let scanning: Promise<void> | undefined
-let delivering: Promise<void> | undefined
+let scanningGeneration = -1
+let delivering: Promise<Map<string, Message[]>> | undefined
+/** Ids this process delivered, per channel: delivery never repeats even when the store refused to record it. */
+const sentNow = new Map<string, Set<string>>()
+/** Rows appended at the main loop's last step, which the model has not read when the turn ends. */
+let endOfTurnRows = new Map<string, Message[]>()
+/** Maintainer actions under way: a second press while one runs does nothing. */
+const busy = new Set<string>()
+/** Full message bodies by id (the pane's state holds previews only). */
+const fullBodies = new Map<string, string>()
 const files = new Map<string, Map<string, CachedFile>>()
 const approvals = new Map<string, Map<string, CachedFile & { ok: boolean }>>()
 const toasted = new Set<string>()
@@ -143,6 +176,8 @@ const paths = {
   messages: (ch: string) => `${root}/channels/${ch}/messages`,
   approvals: (ch: string) => `${root}/channels/${ch}/approvals`,
   declined: (ch: string) => `${root}/channels/${ch}/declined`,
+  /** One file per message on hold, shared by the pane and the web desk. */
+  held: (ch: string) => `${root}/channels/${ch}/held`,
 }
 
 /**
@@ -159,6 +194,17 @@ const seenKey = (ch: string) => `seen:maintainer:${ch}`
 const notifiedKey = () => `notified:${owner()}`
 /** The messages that already woke this session. */
 const wokenKey = () => `woken:${owner()}`
+/** When this owner last started: an owner with no identity and no start for STALE_MS is cleared from the store. */
+const activeKey = (who = owner()) => `active:${who}`
+/** The transcript this owner last ran under: a new one at start means a fork (a rewind) or a resume. */
+const transcriptKey = () => `transcript:${owner()}`
+/** The messages delivered since the last compaction, {ch, id}: what a rewind may have taken out again. */
+const recentKey = () => `recent:${owner()}`
+/** An identity handed over to another session from the folder-loaded store: never imported again. */
+const releasedKey = (who: string) => `released:${who}`
+const STALE_MS = 14 * 86_400_000
+
+const asList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
 
 const readWoken = async ($: Engine): Promise<Set<string>> => {
   const value = await $.store.get(wokenKey())
@@ -170,18 +216,136 @@ const readWoken = async ($: Engine): Promise<Set<string>> => {
 
 const init = async ($: Engine) => {
   sessionId = await $.session.id()
-  // The only environment the plugin reads: the home folder, to place the comms folder.
+  // The environment the plugin reads: the home folder, to place the comms folder.
   // USERPROFILE on Windows (always set there, with its drive letter), HOME elsewhere.
-  home = toSlashes((await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? '')
+  home = toSlashes(((await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? '').trim())
   windows = /^[A-Za-z]:\//.test(home)
-  // the folder: the plugin's "Comms folder" setting (userConfig `folder`), else agent-comms in the home folder
-  root = absolutize(folderOption !== '' ? folderOption : `${home}/agent-comms`, home || '/', home)
+  // the folder: the plugin's "Comms folder" setting (userConfig `folder`), else agent-comms in the home
+  // folder; with neither a setting nor a home folder there is none (never a folder at the disk's root)
+  root = folderOption !== '' && (home !== '' || /^([A-Za-z]:)?[\\/]/.test(folderOption))
+    ? absolutize(folderOption, home || '/', home)
+    : home !== '' ? `${absolutize(home, '/', home).replace(/\/$/, '')}/agent-comms` : ''
+  realRoot = undefined
+  // The desktop app's id for this session lasts across restarts. A `claude` started from this session's
+  // shell, a hook or an MCP server inherits it; the engine marks such a child with CLAUDECODE or
+  // CLAUDE_CODE_CHILD_SESSION and ignores the id there, and so does this plugin: the child keeps its own.
   const host = await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')
-  hostId = host !== undefined && host !== '' ? host : undefined
-  await importFolderLoadedStore($)
-  let stored = await $.store.get(identityKey())
-  if (stored === undefined && hostId !== undefined && sessionId !== undefined) stored = await adoptTranscriptRecords($, sessionId)
+  const isChild = ((await $.env.get('CLAUDECODE')) ?? '') !== '' || ((await $.env.get('CLAUDE_CODE_CHILD_SESSION')) ?? '') !== ''
+  hostId = host !== undefined && host !== '' && !isChild ? host : undefined
+  await quietly($, async () => {
+    await $.store.set(activeKey(), await $.clock.now())
+    await importFolderLoadedStore($)
+  })
+  let stored = await $.store.get(identityKey()).catch(() => undefined)
+  if (stored === undefined && hostId !== undefined && sessionId !== undefined) stored = await quietly($, () => adoptTranscriptRecords($, sessionId ?? ''))
   me = typeof stored === 'string' && isId(stored) ? stored : undefined
+  await quietly($, async () => {
+    const lastTranscript = await $.store.get(transcriptKey())
+    await $.store.set(transcriptKey(), sessionId)
+    // a desktop session that comes back under a new transcript was forked (a rewind) or resumed:
+    // what the fork cut out of the conversation is delivered again
+    if (hostId !== undefined && me !== undefined && typeof lastTranscript === 'string' && lastTranscript !== sessionId) await recheckDeliveries($)
+    await clearStaleOwners($)
+  })
+}
+
+/** Runs `work`, logging (never throwing) a failure, so a full store cannot stop a hook. */
+const quietly = async <T,>($: Engine, work: () => Promise<T>): Promise<T | undefined> => {
+  try {
+    return await work()
+  } catch (error) {
+    $.ui.log(`agent-comms: ${String(error)}`, { to: 'debug' })
+    return undefined
+  }
+}
+
+/**
+ * Removes the records of owners that are gone: no identity, and no start for
+ * STALE_MS. The store is one file shared by every session (4 MiB in all), and
+ * nothing else ever deletes a finished session's delivered lists.
+ */
+const clearStaleOwners = async ($: Engine) => {
+  const keys = await $.store.keys()
+  const named = new Set(keys.filter(k => k.startsWith('identity:')).map(k => k.slice('identity:'.length)))
+  const byOwner = new Map<string, string[]>()
+  for (const key of keys) {
+    const found = /^(delivered|notified|woken|active|transcript|recent):([^:]+)(:.*)?$/.exec(key)
+    const who = found?.[2]
+    if (who === undefined) continue
+    byOwner.set(who, [...(byOwner.get(who) ?? []), key])
+  }
+  const now = await $.clock.now()
+  for (const [who, owned] of byOwner) {
+    if (who === owner() || named.has(who)) continue
+    const active = await $.store.get(activeKey(who))
+    if (typeof active === 'number' && now - active < STALE_MS) continue
+    for (const key of owned) await $.store.delete(key)
+  }
+}
+
+/**
+ * After a rewind the conversation no longer holds what was delivered after
+ * the point it went back to: each such message (since the last compaction) is
+ * taken out of the delivered record and delivered again. A conversation that
+ * is empty (/clear) or too long to read whole is left as it is.
+ */
+const recheckDeliveries = async ($: Engine) => {
+  const recent = (await $.store.get(recentKey()).catch(() => undefined)) as unknown
+  const list = Array.isArray(recent)
+    ? recent.filter((r): r is { ch: string; id: string } => typeof r === 'object' && r !== null && typeof (r as { ch?: unknown }).ch === 'string' && typeof (r as { id?: unknown }).id === 'string')
+    : []
+  if (list.length === 0) return
+  const rows = await $.session.messages().catch(() => undefined)
+  if (rows === undefined || rows.length < 2 || rows.length >= 4096) return
+  const text = rows.map(r => r.text).join('\n')
+  const lost = list.filter(r => !text.includes(`(id ${r.id})`))
+  if (lost.length === 0) return
+  for (const ch of new Set(lost.map(r => r.ch))) {
+    const gone = new Set(lost.filter(r => r.ch === ch).map(r => r.id))
+    await $.store.set(deliveredKey(ch), asList(await $.store.get(deliveredKey(ch))).filter(id => !gone.has(id)))
+    for (const id of gone) sentNow.get(ch)?.delete(id)
+  }
+  const goneIds = new Set(lost.map(r => r.id))
+  await $.store.set(wokenKey(), asList(await $.store.get(wokenKey())).filter(id => !goneIds.has(id)))
+  await $.store.set(recentKey(), list.filter(r => !goneIds.has(r.id)))
+  $.ui.log(`agent-comms: ${lost.length} message${lost.length === 1 ? '' : 's'} a rewind took out of the conversation will be delivered again.`, { to: 'debug' })
+}
+
+/**
+ * The transcript id changes without a session.start after /clear or /resume
+ * (and after an in-place rewind). Desktop: the owner is the app's id, so only
+ * the rewind check runs. Terminal: a conversation with an identity of its own
+ * takes it back (/resume); otherwise this session carries its identity and
+ * records over to the new transcript (/clear).
+ */
+const followTranscript = async ($: Engine) => {
+  const now = await $.session.id().catch(() => undefined)
+  if (now === undefined || now === sessionId) return
+  const earlier = sessionId
+  sessionId = now
+  if (hostId !== undefined) {
+    await quietly($, async () => {
+      await $.store.set(transcriptKey(), now)
+      if (me !== undefined) await recheckDeliveries($)
+    })
+    return
+  }
+  await quietly($, async () => {
+    const theirs = await $.store.get(`identity:${now}`)
+    if (typeof theirs === 'string' && isId(theirs)) {
+      if (theirs !== me) {
+        generation += 1
+        me = theirs
+        unread = new Map()
+      }
+      return
+    }
+    if (earlier !== undefined && me !== undefined) {
+      await takeRecordsOf($, earlier)
+      await $.store.set(identityKey(), me)
+      await $.store.delete(`identity:${earlier}`)
+    }
+  })
 }
 
 /** The store files the plugin kept while loaded as a folder (`agent-comms_inline-*.json`), parsed. */
@@ -222,7 +386,6 @@ const importFolderLoadedStore = async ($: Engine) => {
   const marker = `imported:${owner()}`
   const isFirst = (await $.store.get(marker)) !== true
   const ids = [...new Set([owner(), sessionId].filter((v): v is string => v !== undefined))]
-  const asList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
   for (const data of stores) {
     for (const [key, value] of Object.entries(data)) {
       const isMyList = ids.some(id => key.startsWith(`delivered:${id}:`) || key === `notified:${id}` || key === `woken:${id}`)
@@ -231,7 +394,9 @@ const importFolderLoadedStore = async ($: Engine) => {
         await $.store.set(key, [...merged])
         continue
       }
-      const isOnce = ids.some(id => key === `identity:${id}`) || key === heldKey() || key.startsWith('seen:maintainer:')
+      const identityOf = ids.find(id => key === `identity:${id}`)
+      if (identityOf !== undefined && (await $.store.get(releasedKey(identityOf))) === true) continue
+      const isOnce = identityOf !== undefined || key === heldKey() || key.startsWith('seen:maintainer:')
       if (isOnce && isFirst && (await $.store.get(key)) === undefined) await $.store.set(key, value)
     }
   }
@@ -254,17 +419,22 @@ const adoptTranscriptRecords = async ($: Engine, transcript: string): Promise<un
   return identity
 }
 
-/** Adds an earlier owner's delivered, announced and woken lists to this session's own. */
+/**
+ * Moves an earlier owner's delivered, announced and woken lists into this
+ * session's own (merged), then deletes the earlier owner's: the store keeps
+ * one copy, not one per session that ever held the name.
+ */
 const takeRecordsOf = async ($: Engine, earlier: string) => {
   if (earlier === owner()) return
-  const asList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
   for (const key of await $.store.keys()) {
     const isTheirs = key.startsWith(`delivered:${earlier}:`) || key === `notified:${earlier}` || key === `woken:${earlier}`
     if (!isTheirs) continue
     const target = key.replace(earlier, owner())
-    const merged = new Set([...asList(await $.store.get(target)), ...asList(await $.store.get(key))])
-    await $.store.set(target, [...merged])
+    const merged = [...new Set([...asList(await $.store.get(target)), ...asList(await $.store.get(key))])]
+    await $.store.set(target, key.startsWith('delivered:') ? merged : merged.slice(-500))
+    await $.store.delete(key)
   }
+  for (const key of [`recent:${earlier}`, `transcript:${earlier}`, `active:${earlier}`]) await $.store.delete(key)
 }
 
 /**
@@ -274,12 +444,13 @@ const takeRecordsOf = async ($: Engine, earlier: string) => {
  * keeps its own semantics: a new reviewer chat receives what it hasn't seen.
  */
 const takeOverAgent = async ($: Engine, id: string) => {
-  // earlier sessions recorded by the folder-loaded copy of the plugin
-  const asList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
+  // earlier sessions recorded by the folder-loaded copy of the plugin: that file is never written,
+  // so the hand-over is recorded here (released:) and the import never brings the name back
   for (const data of await readFolderLoadedStores($)) {
     for (const [key, value] of Object.entries(data)) {
       if (!key.startsWith('identity:') || value !== id || key === identityKey()) continue
       const earlier = key.slice('identity:'.length)
+      await $.store.set(releasedKey(earlier), true)
       for (const [k, v] of Object.entries(data)) {
         const isTheirs = k.startsWith(`delivered:${earlier}:`) || k === `notified:${earlier}` || k === `woken:${earlier}`
         if (!isTheirs) continue
@@ -377,6 +548,47 @@ const readConfigText = async ($: Engine): Promise<string | undefined> => {
   return text
 }
 
+/**
+ * One change to channels.json, as the mods API allows (no lock, no atomic
+ * swap): read; ask `change` what to do; read again just before writing and
+ * start over if the file moved; write; then the next pass reads it back and
+ * asks again, so a change another writer landed on top of is made again.
+ * `change` answers { write } (the whole new object), { done } or { stop }.
+ */
+type ConfigStep = { write: Record<string, unknown> } | { done: true } | { stop: string }
+const changeConfig = async (
+  $: Engine,
+  change: (raw: Record<string, unknown>, cfg: Config) => ConfigStep,
+): Promise<{ ok: true; cfg: Config } | { ok: false; reason: string }> => {
+  const configPath = paths.config()
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const text = await readConfigText($)
+    if (typeof text !== 'string') return { ok: false, reason: 'the folder is not set up yet: run /comms-setup first.' }
+    let raw: unknown
+    try {
+      raw = JSON.parse(text)
+    } catch {
+      raw = undefined
+    }
+    const cfg = parseConfig(text)
+    if (cfg === undefined || typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      return { ok: false, reason: `${configPath} is unreadable; it was left alone.` }
+    }
+    const step = change(raw as Record<string, unknown>, cfg)
+    if ('stop' in step) return { ok: false, reason: step.stop }
+    if ('done' in step) {
+      config = cfg
+      return { ok: true, cfg }
+    }
+    if (attempt === 3) break
+    if ((await readConfigText($)) !== text) continue
+    const written = await writeAtomic($, root, 'channels.json', `${JSON.stringify(step.write, null, 2)}\n`, true)
+    if (!written.ok) return { ok: false, reason: `channels.json not written: ${written.reason}` }
+  }
+
+  return { ok: false, reason: 'channels.json kept changing under this write; nothing was lost, but try again.' }
+}
+
 const loadConfig = async ($: Engine): Promise<Config | undefined> => {
   const text = await readConfigText($)
   config = typeof text === 'string' ? parseConfig(text) : undefined
@@ -399,7 +611,12 @@ const scanChannel = async ($: Engine, channel: Channel): Promise<ChannelScan> =>
     if (isFresh) continue
     const text = await $.fs.read(`${dir}/${entry.name}`).catch(() => undefined)
     const stem = entry.name.slice(0, -'.json'.length)
-    const parsed = typeof text === 'string' ? parse(text, stem) : { ok: false as const, reason: 'unreadable' }
+    if (typeof text !== 'string') {
+      // a refusal that may pass (a busy file, too many open files): counted now, read again next scan
+      cache.set(entry.name, { size: -1, mtimeMs: -1, bad: 'unreadable' })
+      continue
+    }
+    const parsed = parse(text, stem)
     const misplaced = parsed.ok ? belongsTo(parsed.message, channel) : undefined
     cache.set(entry.name, {
       size: entry.size,
@@ -415,6 +632,7 @@ const scanChannel = async ($: Engine, channel: Channel): Promise<ChannelScan> =>
   const approvalCache = approvals.get(channel.id) ?? new Map<string, CachedFile & { ok: boolean }>()
   approvals.set(channel.id, approvalCache)
   const approved = new Set<string>()
+  const unreadableRecords = new Set<string>()
   for (const entry of (await listSafe($, approvalDir)).entries) {
     if (entry.kind !== 'file' || !isCandidateFile(entry.name)) continue
     const stem = entry.name.slice(0, -'.json'.length)
@@ -422,10 +640,12 @@ const scanChannel = async ($: Engine, channel: Channel): Promise<ChannelScan> =>
     if (held === undefined || (!held.ok && (held.size !== entry.size || held.mtimeMs !== entry.mtimeMs))) {
       const text = await $.fs.read(`${approvalDir}/${entry.name}`).catch(() => undefined)
       const ok = typeof text === 'string' && parseApproval(text, stem) !== undefined
-      held = { size: entry.size, mtimeMs: entry.mtimeMs, ok }
+      // a read error is not remembered against the file's size and time: read it again next scan
+      held = { size: typeof text === 'string' ? entry.size : -1, mtimeMs: typeof text === 'string' ? entry.mtimeMs : -1, ok }
       approvalCache.set(entry.name, held)
     }
     if (held.ok) approved.add(stem)
+    else unreadableRecords.add(stem)
   }
 
   const declined = new Map<string, string>()
@@ -436,6 +656,12 @@ const scanChannel = async ($: Engine, channel: Channel): Promise<ChannelScan> =>
     const text = await $.fs.read(`${declinedDir}/${entry.name}`).catch(() => undefined)
     const record = typeof text === 'string' ? parseDecline(text, stem) : undefined
     if (record !== undefined) declined.set(stem, record.reason)
+    else unreadableRecords.add(stem)
+  }
+
+  const held = new Set<string>()
+  for (const entry of (await listSafe($, paths.held(channel.id))).entries) {
+    if (entry.kind === 'file' && isCandidateFile(entry.name)) held.add(entry.name.slice(0, -'.json'.length))
   }
 
   const messages: Message[] = []
@@ -446,20 +672,34 @@ const scanChannel = async ($: Engine, channel: Channel): Promise<ChannelScan> =>
   }
   messages.sort((a, b) => (a.ts === b.ts ? a.id.localeCompare(b.id) : a.ts.localeCompare(b.ts)))
 
-  return { channel, messages, skipped, missing: listed.missing, approved, declined }
+  return { channel, messages, skipped, missing: listed.missing, approved, declined, held, unreadableRecords }
 }
 
+/** What this session already received on `ch`: the store's record plus what this process sent. */
 const readDelivered = async ($: Engine, ch: string): Promise<Set<string>> => {
-  const value = await $.store.get(deliveredKey(ch))
+  const value = await $.store.get(deliveredKey(ch)).catch(() => undefined)
 
-  return new Set(Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [])
+  return new Set([...asList(value), ...(sentNow.get(ch) ?? [])])
 }
 
+/**
+ * Records `ids` as delivered: in this process first (so nothing is appended
+ * twice even if the store refuses), then in the store. A store that is full
+ * (4 MiB, shared by every session) is reported on the status line, not thrown.
+ */
 const markDelivered = async ($: Engine, ch: string, ids: readonly string[]) => {
   if (ids.length === 0) return
-  const held = await readDelivered($, ch)
-  for (const id of ids) held.add(id)
-  await $.store.set(deliveredKey(ch), [...held])
+  const sent = sentNow.get(ch) ?? new Set<string>()
+  for (const id of ids) sent.add(id)
+  sentNow.set(ch, sent)
+  try {
+    const stored = new Set(asList(await $.store.get(deliveredKey(ch))))
+    for (const id of ids) stored.add(id)
+    await $.store.set(deliveredKey(ch), [...stored])
+  } catch (error) {
+    $.ui.status('comms: the plugin store is full; delivery records were not saved (see the debug log)')
+    $.ui.log(`agent-comms: delivered record not saved: ${String(error)}`, { to: 'debug' })
+  }
 }
 
 // ---- the poll --------------------------------------------------------
@@ -467,10 +707,10 @@ const markDelivered = async ($: Engine, ch: string, ids: readonly string[]) => {
 const agentStatus = (mine: readonly Channel[]): string =>
   mine.map(c => `comms #${c.id}: ${unread.get(c.id)?.length ?? 0} new`).join(' · ')
 
-const scanAsAgent = async ($: Engine, cfg: Config, self: string) => {
+const scanAsAgent = async ($: Engine, cfg: Config, self: string, gen: number) => {
   const mine = channelsFor(cfg, self)
   if (mine.length === 0) {
-    $.ui.status(`comms: ${self} is in no channel of channels.json`)
+    if (gen === generation) $.ui.status(`comms: ${self} is in no channel of channels.json`)
     return
   }
   const next = new Map<string, Message[]>()
@@ -478,21 +718,27 @@ const scanAsAgent = async ($: Engine, cfg: Config, self: string) => {
     const scanned = await scanChannel($, channel)
     const delivered = await readDelivered($, channel.id)
     const fresh = scanned.messages.filter(
-      m => isDeliverable(m, self, scanned.approved, cfg.require_approval) && !delivered.has(m.id),
+      m => isDeliverable(m, self, scanned.approved, cfg.require_approval, scanned.declined) && !delivered.has(m.id),
     )
     next.set(channel.id, fresh)
+  }
+  // the identity changed while this poll ran (/comms-as off, a switch, a take-over): change nothing
+  if (gen !== generation || me !== self) return
+  for (const [ch, fresh] of next) {
     for (const m of fresh) {
       if (toasted.has(m.id)) continue
       toasted.add(m.id)
-      $.ui.toast(`comms #${channel.id}: new ${m.kind} from ${m.from}`)
+      $.ui.toast(`comms #${ch}: new ${m.kind} from ${m.from}`)
     }
   }
   unread = next
   $.ui.status(agentStatus(mine))
-  // a Chat reviewer reads on its own schedule: a Code session holding `reviewer` is woken only under reviewer_mode "code"
-  const wakes = cfg.auto_wake && !(isReviewer(self) && cfg.reviewer_mode === 'chat')
-  if (wakes && !turnRunning) await wake($, next)
+  const isBusy = (await read($, turnAtom)) !== ''
+  if (wakesFor(cfg, self) && !isBusy) await wake($, next, 'follow')
 }
+
+/** A Chat reviewer reads on its own schedule: a Code session holding `reviewer` is woken only under reviewer_mode "code". */
+const wakesFor = (cfg: Config, self: string): boolean => cfg.auto_wake && !(isReviewer(self) && cfg.reviewer_mode === 'chat')
 
 /**
  * An idle session acts on what reached it: a prompt of the plugin's own
@@ -501,55 +747,84 @@ const scanAsAgent = async ($: Engine, cfg: Config, self: string) => {
  * Only deliverable messages count, so an unapproved reviewer message wakes
  * nobody; each message wakes a session at most once (kept in the store).
  */
-const wake = async ($: Engine, fresh: ReadonlyMap<string, readonly Message[]>) => {
-  const woken = await readWoken($)
+const wake = async ($: Engine, fresh: ReadonlyMap<string, readonly Message[]>, where: 'follow' | 'above') => {
+  const woken = await readWoken($).catch(() => new Set<string>())
   const news: { ch: string; m: Message }[] = []
   for (const [ch, list] of fresh) for (const m of list) if (!woken.has(m.id)) news.push({ ch, m })
   if (news.length === 0) return
   for (const { m } of news) woken.add(m.id)
-  await $.store.set(wokenKey(), [...woken].slice(-500))
+  await quietly($, () => $.store.set(wokenKey(), [...woken].slice(-500)))
   const channels = [...new Set(news.map(n => `#${n.ch}`))].join(', ')
   const senders = [...new Set(news.map(n => n.m.from))].join(', ')
-  const count = news.length === 1 ? 'A new agent-comms message' : `${news.length} new agent-comms messages`
+  const one = news.length === 1
+  const count = one ? 'A new agent-comms message' : `${news.length} new agent-comms messages`
+  const place = where === 'follow'
+    ? `${one ? 'It follows' : 'They follow'} this note`
+    : `${one ? 'It reached' : 'They reached'} you at the end of your last turn and ${one ? 'is' : 'are'} just above this note`
   void $.prompt
     .submit({
-      text: `${count} for you on ${channels} (from ${senders}). They follow this note; read them, act on them as your work allows, and reply with comms_post.`,
+      text: `${count} for you on ${channels} (from ${senders}). ${place}; read ${one ? 'it' : 'them'}, act on ${one ? 'it' : 'them'} as your work allows, and reply with comms_post.`,
     })
     .catch(error => $.ui.log(`agent-comms: wake failed: ${String(error)}`, { to: 'debug' }))
 }
 
-const scanAsMaintainer = async ($: Engine, cfg: Config) => {
+/**
+ * Whether the maintainer has seen `id` on a channel: the stored value is the
+ * channel's message ids when it was last opened (newest SEEN_CAP, in order); an
+ * id older than the oldest kept counts as seen. A legacy value is one id: ids
+ * at or before it count as seen.
+ */
+const SEEN_CAP = 1000
+const seenTest = (value: unknown): ((id: string) => boolean) => {
+  if (typeof value === 'string') return id => id.localeCompare(value) <= 0
+  const ids = asList(value)
+  if (ids.length === 0) return () => false
+  const set = new Set(ids)
+  const oldest = ids[0] ?? ''
+
+  return id => set.has(id) || (ids.length >= SEEN_CAP && id.localeCompare(oldest) < 0)
+}
+
+/** The pane's state holds message previews, never more than this many characters in all (state values stop at 4 MiB). */
+const STATE_TEXT_BUDGET = 1_500_000
+
+const scanAsMaintainer = async ($: Engine, cfg: Config, gen: number) => {
   const rows: CommsChannelRow[] = []
   const threads: Record<string, CommsThreadItem[]> = {}
   let pendingAll = 0
   // the mobile app draws no pane and no toast, but it shows the transcript: a notice line reaches it
   const surfaces: readonly string[] = await $.session.surfaces().catch(() => [])
   const hasPhone = surfaces.includes('mobile')
-  const notified = await readNotified($)
+  const notified = await readNotified($).catch(() => new Set<string>())
   const nowNotified: string[] = []
-  const held = await readHeld($)
+  const heldInStore = await readHeld($).catch(() => new Set<string>())
+  const announce: (() => void)[] = []
   for (const channel of cfg.channels) {
     const scanned = await scanChannel($, channel)
-    const seen = await $.store.get(seenKey(channel.id))
-    const seenId = typeof seen === 'string' ? seen : ''
+    const isSeen = seenTest(await $.store.get(seenKey(channel.id)).catch(() => undefined))
     let pending = 0
     let unseen = 0
     const items: CommsThreadItem[] = []
+    const reviewers = new Set(channel.members.filter(isReviewer))
     for (const m of scanned.messages) {
+      fullBodies.set(m.id, m.body)
+      for (const id of [m.from, m.to]) if (isReviewer(id) && memberOf(channel, id)) reviewers.add(id)
       const isPending = isAwaitingApproval(m, scanned.approved, cfg.require_approval, scanned.declined)
       if (isPending) pending += 1
-      if (m.from !== MAINTAINER && m.id.localeCompare(seenId) > 0) unseen += 1
-      const isUnseen = m.from !== MAINTAINER && m.id.localeCompare(seenId) > 0
+      const isUnseen = m.from !== MAINTAINER && !isSeen(m.id)
+      if (isUnseen) unseen += 1
       const needsYou = isPending || (m.to === MAINTAINER && isUnseen)
       if (needsYou && !notified.has(m.id)) {
         notified.add(m.id)
         nowNotified.push(m.id)
-        $.ui.toast(
-          isPending
-            ? `comms #${channel.id}: ${m.from}'s ${m.kind} awaits your approval (/comms)`
-            : `comms #${channel.id}: new ${m.kind} from ${m.from} (/comms)`,
-        )
-        if (hasPhone) $.ui.log(phoneNotice(channel.id, m, isPending))
+        announce.push(() => {
+          $.ui.toast(
+            isPending
+              ? `comms #${channel.id}: ${m.from}'s ${m.kind} awaits your approval (/comms)`
+              : `comms #${channel.id}: new ${m.kind} from ${m.from} (/comms)`,
+          )
+          if (hasPhone) $.ui.log(phoneNotice(channel.id, m, isPending))
+        })
       }
       items.push({
         id: m.id,
@@ -558,9 +833,10 @@ const scanAsMaintainer = async ($: Engine, cfg: Config) => {
         kind: m.kind,
         ts: m.ts,
         body: m.body,
+        length: m.body.length,
         pending: isPending,
         declined: scanned.declined.get(m.id) ?? null,
-        held: isPending && held.has(m.id),
+        held: isPending && (scanned.held.has(m.id) || heldInStore.has(m.id)),
         fresh: isUnseen,
       })
     }
@@ -569,7 +845,7 @@ const scanAsMaintainer = async ($: Engine, cfg: Config) => {
     rows.push({
       id: channel.id,
       agents: agentsOf(channel),
-      reviewers: channel.members.filter(isReviewer),
+      reviewers: [...reviewers],
       total: scanned.messages.length,
       unread: unseen,
       pending,
@@ -577,7 +853,15 @@ const scanAsMaintainer = async ($: Engine, cfg: Config) => {
       missing: scanned.missing,
     })
   }
-  if (nowNotified.length > 0) await $.store.set(notifiedKey(), [...notified].slice(-500))
+  // the identity changed while this poll ran: change nothing
+  if (gen !== generation || me !== MAINTAINER) return
+  for (const say of announce) say()
+  if (nowNotified.length > 0) await quietly($, () => $.store.set(notifiedKey(), [...notified].slice(-500)))
+  // previews only in state, cut evenly when the threads together would pass the budget
+  const all = Object.values(threads).flat()
+  const total = all.reduce((n, m) => n + Math.min(m.body.length, PREVIEW_CHARS), 0)
+  const each = total > STATE_TEXT_BUDGET ? Math.max(200, Math.floor(STATE_TEXT_BUDGET / Math.max(1, all.length))) : PREVIEW_CHARS
+  for (const list of Object.values(threads)) for (const m of list) if (m.body.length > each) m.body = clip(m.body, each)
   await update($, channelsAtom, () => rows)
   await update($, threadsAtom, () => threads)
   await update($, reviewerModeAtom, () => cfg.reviewer_mode)
@@ -586,17 +870,32 @@ const scanAsMaintainer = async ($: Engine, cfg: Config) => {
 
 const scan = async ($: Engine): Promise<void> => {
   if (me === undefined) return
-  if (scanning) return scanning
-  const self = me
+  if (scanning) {
+    if (scanningGeneration === generation) return scanning
+    // a poll for an earlier identity is still running: let it finish (it changes nothing), then poll again
+    await scanning
+    return scan($)
+  }
+  const gen = generation
+  scanningGeneration = gen
   scanning = (async () => {
+    await followTranscript($)
+    if (!(await stillMe($))) return
+    const self = me
+    if (self === undefined || gen !== generation) return
+    if (root === '') {
+      $.ui.status('comms: no home folder (HOME is not set); set the Comms folder in /config')
+      return
+    }
     const cfg = await loadConfig($)
+    if (gen !== generation || me !== self) return
     if (cfg === undefined) {
       $.ui.status('comms: not set up (/comms-setup)')
       return
     }
     schedule($, cfg)
-    if (self === MAINTAINER) await scanAsMaintainer($, cfg)
-    else await scanAsAgent($, cfg, self)
+    if (self === MAINTAINER) await scanAsMaintainer($, cfg, gen)
+    else await scanAsAgent($, cfg, self, gen)
   })()
     .catch(error => $.ui.log(`agent-comms: poll failed: ${String(error)}`, { to: 'debug' }))
     .finally(() => {
@@ -604,6 +903,28 @@ const scan = async ($: Engine): Promise<void> => {
     })
 
   return scanning
+}
+
+/**
+ * Whether this session still holds its identity in the store. When another
+ * session took the name (/comms-as there), this one steps down at once
+ * instead of going on receiving and posting as it.
+ */
+const stillMe = async ($: Engine): Promise<boolean> => {
+  if (me === undefined) return false
+  const stored = await $.store.get(identityKey()).catch(() => me)
+  if (stored === me) return true
+  const was = me
+  generation += 1
+  me = undefined
+  timer?.cancel()
+  timer = undefined
+  timerMs = 0
+  unread = new Map()
+  $.ui.status(`comms: ${was} was taken by another session (/comms-as ${was} here to take it back)`)
+  $.ui.invalidate('ui.render')
+
+  return false
 }
 
 const schedule = ($: Engine, cfg: Config | undefined) => {
@@ -624,24 +945,37 @@ const schedule = ($: Engine, cfg: Config | undefined) => {
  * request from the loop's top). Called only at a step boundary: a turn's
  * start and each model request, never while a tool runs.
  */
-const deliver = async ($: Engine): Promise<void> => {
-  if (me === undefined || me === MAINTAINER) return
+const deliver = async ($: Engine): Promise<Map<string, Message[]>> => {
+  if (me === undefined || me === MAINTAINER) return new Map()
   if (delivering) return delivering
   delivering = (async () => {
+    const sent = new Map<string, Message[]>()
+    const requireApproval = config?.require_approval !== false
     for (const [ch, list] of unread) {
-      const done: string[] = []
+      const done: Message[] = []
       const delivered = await readDelivered($, ch)
       for (const m of list) {
         if (delivered.has(m.id)) continue
-        if (!(await appendRow($, deliveryText(ch, m)))) break
-        done.push(m.id)
+        if (!(await appendRow($, deliveryText(ch, m, requireApproval && isGated(m))))) break
+        done.push(m)
+        // recorded at once, so a later failure in this loop cannot send it again
+        await markDelivered($, ch, [m.id])
       }
-      await markDelivered($, ch, done)
-      unread.set(ch, list.filter(m => !done.includes(m.id)))
+      if (done.length > 0) sent.set(ch, done)
+      unread.set(ch, list.filter(m => !done.includes(m)))
     }
+    await quietly($, async () => {
+      const added = [...sent].flatMap(([ch, list]) => list.map(m => ({ ch, id: m.id })))
+      if (added.length > 0) await $.store.set(recentKey(), [...((await $.store.get(recentKey())) as unknown[] | undefined ?? []), ...added].slice(-100))
+    })
     if (config && me) $.ui.status(agentStatus(channelsFor(config, me)))
+
+    return sent
   })()
-    .catch(error => $.ui.log(`agent-comms: delivery failed: ${String(error)}`, { to: 'debug' }))
+    .catch(error => {
+      $.ui.log(`agent-comms: delivery failed: ${String(error)}`, { to: 'debug' })
+      return new Map<string, Message[]>()
+    })
     .finally(() => {
       delivering = undefined
     })
@@ -673,7 +1007,7 @@ const guard = async ($: Engine, e: ToolCallInput): Promise<string | undefined> =
   if (root === '') return undefined
   const real = await resolveRealRoot($)
   const roots = real !== undefined && real !== root ? [root, real] : [root]
-  const pathStrings = stringsUnder(input, PATH_KEYS)
+  const pathStrings = stringsUnder(input, isPathKey)
   if (pathStrings.length > 0) {
     const cwd = await $.session.cwd()
     for (const raw of pathStrings) {
@@ -683,10 +1017,10 @@ const guard = async ($: Engine, e: ToolCallInput): Promise<string | undefined> =
       if (placed !== undefined && roots.some(r => isInside(placed, r))) return denyText(root)
     }
   }
-  // Best effort: a shell command is matched on the root's spellings only.
+  // Best effort: a shell command is matched on the root's spellings only; one that only reads is let through.
   const spellings = rootSpellings(roots, home)
   for (const command of stringsUnder(input, COMMAND_KEYS)) {
-    if (commandMentionsRoot(command, spellings, base(root))) return denyText(root)
+    if (commandMentionsRoot(command, spellings, base(root)) && !isReadOnlyCommand(command)) return denyText(root)
   }
 
   return undefined
@@ -755,7 +1089,7 @@ const serveRead = async ($: Engine, input: Record<string, unknown>): Promise<Too
   for (const channel of mine) {
     if (only !== undefined && channel.id !== only) continue
     const list = unread.get(channel.id) ?? []
-    for (const m of list) out.push(deliveryText(channel.id, m))
+    for (const m of list) out.push(deliveryText(channel.id, m, cfg.require_approval && isGated(m)))
     await markDelivered($, channel.id, list.map(m => m.id))
     unread.set(channel.id, [])
   }
@@ -775,6 +1109,7 @@ const servePost = async ($: Engine, input: Record<string, unknown>): Promise<Too
   const cfg = await loadConfig($)
   if (cfg === undefined) return { deny: 'agent-comms: channels.json is missing or unreadable (/comms-setup).' }
   const mine = channelsFor(cfg, me)
+  if (mine.length === 0) return { deny: `agent-comms: ${me} is in no channel of channels.json.` }
   if (to === ALL) {
     const groups = mine.filter(c => isGroup(c) && (channel === undefined || c.id === channel))
     if (groups.length !== 1) {
@@ -783,8 +1118,9 @@ const servePost = async ($: Engine, input: Record<string, unknown>): Promise<Too
       }
     }
   }
-  const holding = mine.filter(c => (to === ALL ? isGroup(c) : memberOf(c, to)) && (channel === undefined || c.id === channel))
-  const target = holding[0]
+  // the maintainer is in every channel; a message to one recipient goes to a one-to-one channel before a group
+  const holding = mine.filter(c => (to === ALL ? isGroup(c) : to === MAINTAINER || memberOf(c, to)) && (channel === undefined || c.id === channel))
+  const target = (to === ALL ? undefined : holding.find(c => !isGroup(c))) ?? holding[0]
   if (target === undefined) {
     return {
       deny: `agent-comms: "${to}" is not in any of your channels${typeof channel === 'string' ? ` (asked for #${channel})` : ''}. ` +
@@ -800,28 +1136,50 @@ const servePost = async ($: Engine, input: Record<string, unknown>): Promise<Too
 
 // ---- the maintainer's actions ----------------------------------------
 
-const approve = async ($: Engine, ch: string, id: string) => {
-  if (me !== MAINTAINER) return
-  const cfg = await loadConfig($)
-  const channel = cfg?.channels.find(c => c.id === ch)
-  if (cfg === undefined || channel === undefined) return
-  const scanned = await scanChannel($, channel)
-  const found = scanned.messages.find(m => m.id === id)
-  if (found === undefined || !isReviewer(found.from)) {
-    await update($, infoAtom, () => `Not approved: ${id} is not a reviewer message on #${ch}.`)
-    return
+/** "Not … : this session is not the maintainer", shown where the press was. */
+const notMaintainer = async ($: Engine) =>
+  update($, infoAtom, () => 'This session is no longer the maintainer: run /comms-as maintainer.')
+
+/** Runs a maintainer action once at a time per message: a double press while one runs does nothing. */
+const once = async <T,>(key: string, work: () => Promise<T>): Promise<T | undefined> => {
+  if (busy.has(key)) return undefined
+  busy.add(key)
+  try {
+    return await work()
+  } finally {
+    busy.delete(key)
   }
-  if (scanned.declined.has(id)) {
-    await update($, infoAtom, () => `Not approved: you declined that message from ${found.from}.`)
-    return
+}
+
+/** Approves reviewer message `id` on `ch`; returns what happened, also shown in the pane. */
+const approve = async ($: Engine, ch: string, id: string): Promise<string> => {
+  if (me !== MAINTAINER) {
+    await notMaintainer($)
+    return 'Not approved: this session is not the maintainer.'
   }
-  const ts = new Date(await $.clock.now()).toISOString()
-  const written = await writeAtomic($, paths.approvals(ch), `${id}.json`, formatApproval({ id, by: MAINTAINER, ts }))
-  await update($, infoAtom, () =>
-    written.ok
+  const outcome = (await once(`approve:${ch}/${id}`, async () => {
+    const cfg = await loadConfig($)
+    const channel = cfg?.channels.find(c => c.id === ch)
+    if (cfg === undefined || channel === undefined) return `Not approved: #${ch} is not in channels.json.`
+    const scanned = await scanChannel($, channel)
+    const found = scanned.messages.find(m => m.id === id)
+    if (found === undefined || !isReviewer(found.from)) return `Not approved: ${id} is not a reviewer message on #${ch}.`
+    if (scanned.declined.has(id)) return `Not approved: you declined that message from ${found.from}.`
+    if (scanned.approved.has(id)) return `Already approved: ${found.from}'s ${found.kind} to ${found.to}.`
+    const ts = new Date(await $.clock.now()).toISOString()
+    // an approval file that does not parse (half written, or not the maintainer's) is replaced
+    const replace = scanned.unreadableRecords.has(id) && (await $.fs.exists(`${paths.approvals(ch)}/${id}.json`))
+    const written = await writeAtomic($, paths.approvals(ch), `${id}.json`, formatApproval({ id, by: MAINTAINER, ts }), replace)
+    if (replace) approvals.get(ch)?.delete(`${id}.json`)
+
+    return written.ok
       ? `✓ Approved ${found.from}'s ${found.kind} to ${found.to}; it reaches ${found.to} at its next step.`
-      : `Approval not written: ${written.reason}`)
+      : `Approval not written: ${written.reason}`
+  })) ?? 'Already approving that message.'
+  await update($, infoAtom, () => outcome)
   await scan($)
+
+  return outcome
 }
 
 const heldKey = () => 'held:maintainer'
@@ -832,8 +1190,8 @@ const readHeld = async ($: Engine): Promise<Set<string>> => {
   return new Set(Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [])
 }
 
-/** The waiting reviewer message `id` on `ch`, or why not. */
-const findWaiting = async ($: Engine, ch: string, id: string): Promise<{ m: Message } | { reason: string }> => {
+/** The waiting reviewer message `id` on `ch` (with its channel's scan), or why not. */
+const findWaiting = async ($: Engine, ch: string, id: string): Promise<{ m: Message; scanned: ChannelScan } | { reason: string }> => {
   const cfg = await loadConfig($)
   const channel = cfg?.channels.find(c => c.id === ch)
   if (cfg === undefined || channel === undefined) return { reason: `#${ch} is not in channels.json.` }
@@ -843,7 +1201,7 @@ const findWaiting = async ($: Engine, ch: string, id: string): Promise<{ m: Mess
     return { reason: 'that message is no longer waiting for approval.' }
   }
 
-  return { m }
+  return { m, scanned }
 }
 
 // ---- text the surfaces will draw ----------------------------------------
@@ -854,19 +1212,27 @@ const findWaiting = async ($: Engine, ch: string, id: string): Promise<{ m: Mess
 const DRAW_LIMIT = 9000
 const PREVIEW_CHARS = 1500
 
-/** Control characters other than tab and newline removed (CRLF becomes LF), then cut to `max`. */
+/** A cut at `at` UTF-16 units, moved back one when it would split an emoji (a surrogate pair). */
+const safeCut = (text: string, at: number): number =>
+  at > 0 && at < text.length && /[\uD800-\uDBFF]/.test(text.charAt(at - 1)) ? at - 1 : at
+
+/**
+ * Control characters other than tab and newline removed: C0, DEL and the C1
+ * range U+0080-U+009F, any of which makes the engine refuse the whole pane;
+ * lone surrogates made U+FFFD; CRLF made LF; then cut to `max` without splitting an emoji.
+ */
 const safeText = (text: string, max = DRAW_LIMIT): string => {
   // eslint-disable-next-line no-control-regex
-  const clean = text.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
+  const clean = wellFormed(text).replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '')
 
-  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean
+  return clean.length > max ? `${clean.slice(0, safeCut(clean, max - 1))}…` : clean
 }
 
 /** The start of a long message, cut at a line end near PREVIEW_CHARS. */
 const preview = (body: string): string => {
   const cut = body.lastIndexOf('\n', PREVIEW_CHARS)
 
-  return `${body.slice(0, cut > PREVIEW_CHARS / 2 ? cut : PREVIEW_CHARS)}\n\n…`
+  return `${body.slice(0, safeCut(body, cut > PREVIEW_CHARS / 2 ? cut : PREVIEW_CHARS))}\n\n…`
 }
 
 /** A body in pieces each within DRAW_LIMIT, cut at line ends where it can be. */
@@ -875,7 +1241,7 @@ const chunks = (body: string): string[] => {
   let rest = body
   while (rest.length > DRAW_LIMIT) {
     const cut = rest.lastIndexOf('\n', DRAW_LIMIT)
-    const at = cut > DRAW_LIMIT / 2 ? cut : DRAW_LIMIT
+    const at = safeCut(rest, cut > DRAW_LIMIT / 2 ? cut : DRAW_LIMIT)
     out.push(rest.slice(0, at))
     rest = rest.slice(at).replace(/^\n/, '')
   }
@@ -887,11 +1253,7 @@ const chunks = (body: string): string[] => {
 /** "an answer", "a ruling": every kind spelled with the article it takes. */
 const withArticle = (word: string): string => `${/^[aeiou]/i.test(word) ? 'an' : 'a'} ${word}`
 
-const firstLine = (body: string, max = 80): string => {
-  const line = body.split('\n').find(l => l.trim() !== '')?.trim() ?? ''
-
-  return line.length > max ? `${line.slice(0, max - 1)}…` : line
-}
+const firstLine = (body: string, max = 80): string => clip(body.split('\n').find(l => l.trim() !== '')?.trim() ?? '', max)
 
 /** A note from the maintainer, written like any message (no approval needed); never one to the maintainer. */
 const postNote = async ($: Engine, ch: string, to: string, body: string) => {
@@ -907,32 +1269,43 @@ const postNote = async ($: Engine, ch: string, to: string, body: string) => {
  * that it is on hold and to expect the maintainer's word soon.
  */
 const hold = async ($: Engine, ch: string, id: string) => {
-  if (me !== MAINTAINER) return
+  if (me !== MAINTAINER) {
+    await notMaintainer($)
+    return
+  }
+  await once(`hold:${ch}/${id}`, () => holdOnce($, ch, id))
+}
+
+const holdOnce = async ($: Engine, ch: string, id: string) => {
   const found = await findWaiting($, ch, id)
   if ('reason' in found) {
     await update($, infoAtom, () => `Not held: ${found.reason}`)
     return
   }
-  const held = await readHeld($)
-  if (held.has(id)) {
-    await update($, infoAtom, () => `Already on hold; ${found.m.from} was told.`)
+  const { m } = found
+  // the hold is a file in the comms folder, so the pane and the web desk share it: its first writer tells
+  // the others, the second finds it there and tells no one twice
+  const ts = new Date(await $.clock.now()).toISOString()
+  const legacy = await readHeld($).catch(() => new Set<string>())
+  const claimed = legacy.has(id)
+    ? ({ ok: false, reason: 'held' } as const)
+    : await writeAtomic($, paths.held(ch), `${id}.json`, formatApproval({ id, by: MAINTAINER, ts }))
+  if (!claimed.ok) {
+    await update($, infoAtom, () => claimed.reason === 'held' || claimed.reason.endsWith('already exists')
+      ? `Already on hold; ${m.from} and ${m.to === ALL ? 'the group' : m.to} were told.`
+      : `Not held: ${claimed.reason}`)
     return
   }
-  const { m } = found
   if (m.to === ALL) {
+    // the group is told that something waits, never what it says: the text is not approved
     const written = await postNote(
       $,
       ch,
       ALL,
-      `On hold: ${withArticle(m.kind)} from ${m.from} to the group ("${firstLine(m.body)}") is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.`,
+      `On hold: ${withArticle(m.kind)} from ${m.from} to the group is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.`,
     )
-    if (!written.ok) {
-      await update($, infoAtom, () => `Hold note not written: ${written.reason}`)
-      return
-    }
-    held.add(id)
-    await $.store.set(heldKey(), [...held].slice(-500))
-    await update($, infoAtom, () => `On hold: the group #${ch} was told to expect a message soon.`)
+    // a note to "all" reaches the reviewer as well
+    await update($, infoAtom, () => !written.ok ? `Hold note not written: ${written.reason}` : `On hold: the group #${ch} (${m.from} included) was told to expect a message soon.`)
     await scan($)
     return
   }
@@ -948,14 +1321,8 @@ const hold = async ($: Engine, ch: string, id: string) => {
     m.to,
     `On hold: ${withArticle(m.kind)} from ${m.from} to you is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.`,
   )
-  const written = toSender.ok ? toAgent : toSender
-  if (!written.ok) {
-    await update($, infoAtom, () => `Hold note not written: ${written.reason}`)
-    return
-  }
-  held.add(id)
-  await $.store.set(heldKey(), [...held].slice(-500))
-  await update($, infoAtom, () => `On hold: ${m.from} and ${m.to} were told to expect a message soon.`)
+  const failed = !toSender.ok ? toSender : !toAgent.ok ? toAgent : undefined
+  await update($, infoAtom, () => failed !== undefined ? `Hold note not written: ${failed.reason}` : `On hold: ${m.from} and ${m.to} were told to expect a message soon.`)
   await scan($)
 }
 
@@ -965,36 +1332,72 @@ const hold = async ($: Engine, ch: string, id: string) => {
  * one else: the agent is never told (the maintainer sees the note in the pane).
  */
 const decline = async ($: Engine, ch: string, id: string, reason: string) => {
-  if (me !== MAINTAINER) return
+  if (me !== MAINTAINER) {
+    await notMaintainer($)
+    return
+  }
+  await once(`decline:${ch}/${id}`, () => declineOnce($, ch, id, reason))
+}
+
+/**
+ * The reviewer always gets the reason. The agent (or the group) is told
+ * nothing, unless the message was on hold: then it was promised word, and is
+ * told the message was declined and nothing is coming (no reason, no text).
+ */
+const declineOnce = async ($: Engine, ch: string, id: string, reason: string) => {
   const found = await findWaiting($, ch, id)
   if ('reason' in found) {
     await update($, infoAtom, () => `Not declined: ${found.reason}`)
     await update($, decliningAtom, () => '')
     return
   }
-  const { m } = found
+  const { m, scanned } = found
   const why = reason.trim()
   const ts = new Date(await $.clock.now()).toISOString()
-  const recorded = await writeAtomic($, paths.declined(ch), `${id}.json`, formatDecline({ id, by: MAINTAINER, ts, reason: why }))
+  // a decline file that does not parse (half written, or not the maintainer's) is replaced
+  const replace = scanned.unreadableRecords.has(id) && (await $.fs.exists(`${paths.declined(ch)}/${id}.json`))
+  const recorded = await writeAtomic($, paths.declined(ch), `${id}.json`, formatDecline({ id, by: MAINTAINER, ts, reason: why }), replace)
   if (!recorded.ok) {
     await update($, infoAtom, () => `Not declined: ${recorded.reason}`)
     return
   }
+  const wasHeld = scanned.held.has(id) || (await readHeld($).catch(() => new Set<string>())).has(id)
   const reasonLine = `Reason: ${why || '(no reason given)'}`
   const toWhom = m.to === ALL ? `the group #${ch}` : m.to
-  await postNote($, ch, m.from, `Declined: your ${m.kind} to ${toWhom} ("${firstLine(m.body)}") was not delivered, and ${m.to === ALL ? 'the group was' : `${m.to} was`} not told.\n${reasonLine}`)
+  const agentSide = m.to === ALL ? 'the group' : m.to
+  const toReviewer = await postNote(
+    $,
+    ch,
+    m.from,
+    wasHeld
+      ? `Declined: your ${m.kind} to ${toWhom} ("${firstLine(m.body)}") was not delivered. ${agentSide} had been told it was on hold, and is now told only that it was declined and nothing is coming.\n${reasonLine}`
+      : `Declined: your ${m.kind} to ${toWhom} ("${firstLine(m.body)}") was not delivered, and ${agentSide} was not told.\n${reasonLine}`,
+  )
+  const toAgent = wasHeld
+    ? await postNote($, ch, m.to, `Declined: the ${m.kind} from ${m.from} that was on hold was declined. Nothing is coming; carry on with your work.`)
+    : ({ ok: true } as const)
   await update($, decliningAtom, () => '')
-  await update($, infoAtom, () => `Declined; only ${m.from} was told why.`)
+  const failed = !toReviewer.ok ? toReviewer : !toAgent.ok ? toAgent : undefined
+  await update($, infoAtom, () =>
+    failed !== undefined
+      ? `Declined, but a note was not written: ${failed.reason}`
+      : wasHeld
+      ? `Declined; ${m.from} was told why, and ${agentSide} that nothing is coming.`
+      : `Declined; only ${m.from} was told why.`)
   await scan($)
 }
 
 const postAsMaintainer = async ($: Engine, ch: string, to: string, value: string) => {
-  if (me !== MAINTAINER) return
+  if (me !== MAINTAINER) {
+    await notMaintainer($)
+    return
+  }
   const { kind, body } = splitKind(value)
   if (body === '') return
   const cfg = await loadConfig($)
   const channel = cfg?.channels.find(c => c.id === ch)
-  if (channel === undefined || !(channel.members.includes(to) || (to === ALL && isGroup(channel)))) {
+  // a named reviewer (Reviewer3) is a member of every channel with a reviewer slot
+  if (channel === undefined || to === MAINTAINER || !(memberOf(channel, to) || (to === ALL && isGroup(channel)))) {
     await update($, infoAtom, () => `Not posted: ${to} is not in #${ch}.`)
     return
   }
@@ -1006,11 +1409,12 @@ const postAsMaintainer = async ($: Engine, ch: string, to: string, value: string
   await scan($)
 }
 
+/** Marks every message now on `ch` seen: their ids (the newest SEEN_CAP), not one high-water id a misdated message could push past. */
 const markSeen = async ($: Engine, ch: string) => {
   const channel = config?.channels.find(c => c.id === ch)
   if (channel === undefined) return
-  const last = (await scanChannel($, channel)).messages.at(-1)
-  if (last) await $.store.set(seenKey(ch), last.id)
+  const ids = (await scanChannel($, channel)).messages.map(m => m.id).slice(-SEEN_CAP)
+  if (ids.length > 0) await quietly($, () => $.store.set(seenKey(ch), ids))
 }
 
 // ---- setup -----------------------------------------------------------
@@ -1028,7 +1432,20 @@ const insideGit = async ($: Engine, dir: string): Promise<boolean> => {
   return false
 }
 
+/**
+ * The config with this session's agent given its own channel, when it joined
+ * (/comms-as <name>) before the folder was set up and no channel lists it yet.
+ */
+const withJoinedAgent = (raw: Record<string, unknown>): Record<string, unknown> => {
+  if (me === undefined || me === MAINTAINER || isReviewer(me) || !Array.isArray(raw.channels)) return raw
+  const pre = parseConfig(JSON.stringify(raw))
+  if (pre === undefined || channelsFor(pre, me).length > 0 || !isNewAgentId(me, pre)) return raw
+
+  return { ...raw, channels: [...raw.channels, { id: me, members: [REVIEWER, me] }] }
+}
+
 const setup = async ($: Engine): Promise<string> => {
+  if (root === '') return 'There is no home folder (HOME is not set): set the Comms folder in /config first.'
   const git = await insideGit($, root)
   if (git) {
     return `${root} is inside a git work tree, so nothing was created. Pick a folder outside any git repository as the plugin's Comms folder setting (/config, or pluginConfigs in settings.json).`
@@ -1048,9 +1465,12 @@ const setup = async ($: Engine): Promise<string> => {
       return `${configPath} exists but is not a JSON object; it was left alone. Fix or move it, then run /comms-setup again.`
     }
     existing = value as Record<string, unknown>
+    if ('channels' in existing && !Array.isArray(existing.channels)) {
+      return `${configPath} has a "channels" value that is not a list; it was left alone. Fix or move it, then run /comms-setup again.`
+    }
   }
-  const merged = mergeConfig(existing)
-  const cfg = parseConfig(JSON.stringify(merged))
+  const merged = withJoinedAgent(mergeConfig(existing))
+  let cfg = parseConfig(JSON.stringify(merged))
   if (cfg === undefined) return `${configPath} has a channel entry this mod cannot read; it was left alone.`
   const listing = cfg.channels.map(c => `#${c.id} (${c.members.join(', ')})`).join(', ')
   $.ui.log(
@@ -1064,12 +1484,24 @@ const setup = async ($: Engine): Promise<string> => {
     .catch(() => 'No')
   if (answer !== 'Yes, create it') return 'setup cancelled; nothing was created.'
 
+  // merged again into the file as it is now: the question may have been open for minutes
   const created: string[] = []
-  if (!hadConfig || JSON.stringify(existing) !== JSON.stringify(merged)) {
+  if (!(await $.fs.exists(configPath))) {
     const written = await writeAtomic($, root, 'channels.json', `${JSON.stringify(merged, null, 2)}\n`, true)
     if (!written.ok) return `channels.json not written: ${written.reason}`
-    created.push(hadConfig ? 'merged channels.json' : 'wrote channels.json')
+    created.push('wrote channels.json')
   }
+  let changed = false
+  const result = await changeConfig($, raw => {
+    if ('channels' in raw && !Array.isArray(raw.channels)) return { stop: `${configPath} now has a "channels" value that is not a list; it was left alone.` }
+    const next = withJoinedAgent(mergeConfig(raw))
+    if (JSON.stringify(next) === JSON.stringify(raw)) return { done: true }
+    changed = true
+    return { write: next }
+  })
+  if (!result.ok) return `channels.json not written: ${result.reason}`
+  if (changed && hadConfig) created.push('merged channels.json')
+  cfg = result.cfg
   const dirs = cfg.channels.flatMap(c => [paths.messages(c.id), paths.approvals(c.id)])
   const failed = await ensureDirs($, dirs)
   if (failed !== undefined) return `could not create the channel folders: ${failed}`
@@ -1116,36 +1548,23 @@ const createGroup = async ($: Engine, args: readonly string[]): Promise<string> 
   const usage = 'Usage: /comms-group <name> <agent> <agent> …, e.g. /comms-group team-a frontend backend (the reviewer is always in it).'
   if (name === undefined || agents.length < 2) return `A group needs a name and at least two agents. ${usage}`
   if (!isGroupId(name)) return `"${name}" can't be a group name: use letters, digits, - or _, not all digits (those are agents' channels). ${usage}`
-  const bad = agents.filter(a => !isId(a) || a === MAINTAINER || isReviewer(a) || a === ALL)
+  const bad = agents.filter(a => !isId(a) || isReservedId(a))
   if (bad.length > 0) return `Not agent ids: ${bad.join(', ')}. ${usage}`
-  const configPath = paths.config()
-  let cfg: Config | undefined
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const text = await readConfigText($)
-    if (typeof text !== 'string') return 'The folder is not set up yet: run /comms-setup first.'
-    cfg = parseConfig(text)
-    let raw: unknown
-    try {
-      raw = JSON.parse(text)
-    } catch {
-      raw = undefined
-    }
-    if (cfg === undefined || typeof raw !== 'object' || raw === null || Array.isArray(raw)) return `${configPath} is unreadable; it was left alone.`
-    const existing = cfg.channels.find(c => c.id === name)
+  if (root === '') return 'There is no home folder (HOME is not set): set the Comms folder in /config first.'
+  const result = await changeConfig($, (raw, now) => {
+    // channel folders on macOS and Windows ignore case: #Team and #team would share one
+    const existing = now.channels.find(c => c.id.toLowerCase() === name.toLowerCase())
     if (existing !== undefined) {
-      const same = agentsOf(existing).slice().sort().join(',') === agents.slice().sort().join(',')
-      if (same) break
-      return `#${name} already exists with ${existing.members.join(', ')}; pick another name.`
+      const same = existing.id === name && agentsOf(existing).slice().sort().join(',') === agents.slice().sort().join(',')
+      return same ? { done: true } : { stop: `#${existing.id} already exists with ${existing.members.join(', ')}; pick another name.` }
     }
-    const record = raw as Record<string, unknown>
-    const channels = Array.isArray(record.channels) ? record.channels : []
-    const merged = { ...record, channels: [...channels, { id: name, members: [REVIEWER, ...agents] }] }
-    const written = await writeAtomic($, root, 'channels.json', `${JSON.stringify(merged, null, 2)}\n`, true)
-    if (!written.ok) return `channels.json not written: ${written.reason}`
-  }
-  cfg = await loadConfig($)
-  const group = cfg?.channels.find(c => c.id === name)
-  if (cfg === undefined || group === undefined) return 'channels.json kept changing; the group was not added. Try again.'
+    const channels = Array.isArray(raw.channels) ? raw.channels : []
+    return { write: { ...raw, channels: [...channels, { id: name, members: [REVIEWER, ...agents] }] } }
+  })
+  if (!result.ok) return result.reason
+  const cfg = result.cfg
+  const group = cfg.channels.find(c => c.id === name)
+  if (group === undefined) return 'channels.json kept changing; the group was not added. Try again.'
   const failed = await ensureDirs($, [paths.messages(name), paths.approvals(name)])
   if (failed !== undefined) return `Could not create the group's folders: ${failed}`
   await writeSetupNotes($, cfg, [group])
@@ -1177,8 +1596,9 @@ const lookalikeOf = (id: string): string | undefined =>
 
 /** A new agent's id: any id but the reserved ones (maintainer, reviewer…, all) and an existing channel that is not its own. */
 const isNewAgentId = (id: string, cfg: Config | undefined): boolean =>
-  isId(id) && id !== MAINTAINER && id !== ALL && !isReviewer(id) &&
-  !(cfg?.channels.some(c => c.id === id && !c.members.includes(id)) ?? false)
+  isId(id) && !isReservedId(id) &&
+  // channel folders on macOS and Windows ignore case: a channel named like it in another case is not its own
+  !(cfg?.channels.some(c => c.id.toLowerCase() === id.toLowerCase() && !(c.id === id && c.members.includes(id))) ?? false)
 
 type AgentRegistration =
   | { ok: true; added: boolean; channels: Channel[]; notes: number }
@@ -1193,37 +1613,20 @@ type AgentRegistration =
  * sessions registering at once do not drop each other's channel.
  */
 const registerAgent = async ($: Engine, id: string): Promise<AgentRegistration> => {
-  const configPath = paths.config()
   let added = false
-  let cfg: Config | undefined
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const text = await readConfigText($)
-    if (typeof text !== 'string') return { ok: false, reason: 'the folder is not set up yet: run /comms-setup first.' }
-    let raw: unknown
-    try {
-      raw = JSON.parse(text)
-    } catch {
-      raw = undefined
-    }
-    cfg = parseConfig(text)
-    if (cfg === undefined || typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-      return { ok: false, reason: `${configPath} is unreadable; it was left alone.` }
-    }
-    if (channelsFor(cfg, id).length > 0) break
-    if (cfg.channels.some(c => c.id === id)) {
-      return { ok: false, reason: `channel ${id} exists but does not list ${id}; fix channels.json by hand.` }
-    }
-    const record = raw as Record<string, unknown>
-    const channels = Array.isArray(record.channels) ? record.channels : []
-    const merged = { ...record, channels: [...channels, { id, members: [REVIEWER, id] }] }
-    const written = await writeAtomic($, root, 'channels.json', `${JSON.stringify(merged, null, 2)}\n`, true)
-    if (!written.ok) return { ok: false, reason: `channels.json not written: ${written.reason}` }
+  // an agent first named in a group still gets its own one-to-one channel with the reviewer
+  const result = await changeConfig($, (raw, now) => {
+    if (now.channels.some(c => !isGroup(c) && c.members.includes(id))) return { done: true }
+    const clash = now.channels.find(c => c.id.toLowerCase() === id.toLowerCase())
+    if (clash !== undefined) return { stop: `channel ${clash.id} exists but is not ${id}'s own; fix channels.json by hand.` }
     added = true
-  }
-  if (cfg === undefined) return { ok: false, reason: 'channels.json could not be read.' }
+    const channels = Array.isArray(raw.channels) ? raw.channels : []
+    return { write: { ...raw, channels: [...channels, { id, members: [REVIEWER, id] }] } }
+  })
+  if (!result.ok) return { ok: false, reason: result.reason }
+  const cfg = result.cfg
   const mine = channelsFor(cfg, id)
   if (mine.length === 0) return { ok: false, reason: `channels.json kept changing; ${id} was not added. Try again.` }
-  config = cfg
   const dirs = mine.flatMap(c => [paths.messages(c.id), paths.approvals(c.id)])
   const failed = await ensureDirs($, dirs)
   if (failed !== undefined) return { ok: false, reason: `could not create the channel folders: ${failed}` }
@@ -1250,13 +1653,15 @@ const join = async ($: Engine) => {
  */
 const leave = async ($: Engine): Promise<string> => {
   const was = me
+  generation += 1
   me = undefined
   timer?.cancel()
   timer = undefined
   timerMs = 0
   unread = new Map()
-  await $.store.delete(identityKey())
+  await quietly($, () => $.store.delete(identityKey()))
   $.ui.status('comms: off (/comms-as <id> to join)')
+  $.ui.invalidate('ui.render')
 
   return was === undefined
     ? 'comms: this session was not joined; it stays off.'
@@ -1266,6 +1671,10 @@ const leave = async ($: Engine): Promise<string> => {
 // ---- the pane's look --------------------------------------------------
 
 const CHAT_SHOWN = 200
+/** Characters of text the pane's messages may use in one drawing (the engine stops at 100,000). */
+const PANE_BUDGET = 80_000
+/** The most of one message drawn when it is opened or waits for approval. */
+const EXPANDED_CHARS = 30_000
 
 type SenderLook = { icon: string; color: string; side: 'left' | 'right' }
 
@@ -1306,8 +1715,7 @@ const readNotified = async ($: Engine): Promise<Set<string>> => {
 
 /** One transcript line for the phone: who, what, the start of the text, and the approval code when it waits for one. */
 const phoneNotice = (ch: string, m: Message, isPending: boolean): string => {
-  const first = m.body.split('\n').find(l => l.trim() !== '')?.trim() ?? ''
-  const text = first.length > 140 ? `${first.slice(0, 139)}…` : first
+  const text = firstLine(wellFormed(m.body), 140)
   const approveHint = isPending ? ` · approve: /comms-approve ${shortCode(m.id)}` : ''
 
   return `📨 #${ch} · ${m.from} → ${m.to} · ${kindLabel(m.kind)}: "${text}"${approveHint}`
@@ -1317,8 +1725,8 @@ const phoneNotice = (ch: string, m: Message, isPending: boolean): string => {
 const isSetupNote = (m: { from: string; kind: string; body: string }): boolean =>
   m.from === MAINTAINER && m.kind === 'note' && m.body.startsWith(setupNoteMarker)
 
-/** A message's short code: the 6 hex at the end of its id. */
-const shortCode = (id: string): string => id.slice(id.lastIndexOf('-') + 1)
+/** A message's short code: what follows its id's last "-" (6 hex for the plugin's own ids), lowercased as typed codes are. */
+const shortCode = (id: string): string => id.slice(id.lastIndexOf('-') + 1).toLowerCase()
 
 /**
  * A tab press: select the channel and show its first new message (or, with
@@ -1364,7 +1772,7 @@ const phoneSummary = async ($: Engine): Promise<string> => {
     if (pending.length === 0 && recent.length === 0) continue
     out.push(`**#${channel.id}**${pending.length > 0 ? ` · ⏳ ${pending.length} waiting for your approval` : ''}`)
     const line = (m: Message) =>
-      `${senderLook(m.from).icon} **${m.from}** → ${m.to} · ${kindLabel(m.kind)} · ${ago(m.ts, nowMs)}\n> ${m.body.slice(0, 500).replace(/\n/g, '\n> ')}`
+      `${senderLook(m.from).icon} **${m.from}** → ${m.to} · ${kindLabel(m.kind)} · ${ago(m.ts, nowMs)}\n> ${clip(wellFormed(m.body), 500).replace(/\n/g, '\n> ')}`
     for (const m of recent) out.push(line(m))
     for (const m of pending) out.push(`${line(m)}\n⏳ Approve: \`/comms-approve ${shortCode(m.id)}\``)
   }
@@ -1374,7 +1782,7 @@ const phoneSummary = async ($: Engine): Promise<string> => {
 
 /** Approves the one waiting reviewer message whose id ends in `code`. */
 const approveByCode = async ($: Engine, code: string): Promise<string> => {
-  if (!/^[0-9a-f]{6}$/.test(code)) return 'give the 6-character code /comms shows, e.g. /comms-approve a1b2c3.'
+  if (code === '') return 'give the code /comms shows, e.g. /comms-approve a1b2c3.'
   const cfg = await loadConfig($)
   if (cfg === undefined) return 'channels.json is missing (/comms-setup).'
   const found: { ch: string; m: Message }[] = []
@@ -1387,21 +1795,24 @@ const approveByCode = async ($: Engine, code: string): Promise<string> => {
   const [hit] = found
   if (hit === undefined) return `no message is waiting for approval with code ${code}.`
   if (found.length > 1) return `${found.length} waiting messages end in ${code}; approve them in the pane on desktop.`
-  await approve($, hit.ch, hit.m.id)
 
-  return `✓ Approved: ${hit.m.from}'s ${hit.m.kind} to ${hit.m.to} on #${hit.ch}.`
+  // what approve() actually did, not a success it assumes
+  return `${await approve($, hit.ch, hit.m.id)} (#${hit.ch})`
 }
 
 // ---- the slash commands (files in commands/; answered here) ---------------
 
 const runCommsAs = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
-  if (!isPersonOrigin(e.origin)) return { text: '/comms-as is run by the person.' }
+  if (!(await isPersonOrigin($, e.origin))) return { text: '/comms-as is run by the person.' }
   if (sessionId === undefined) await init($)
-  const id = e.args.trim()
+  const typed = e.args.trim()
+  // the reserved words in any case mean themselves; a reviewer's name keeps its case (Reviewer3)
+  const id = typed.toLowerCase() === MAINTAINER ? MAINTAINER : typed
   if (id === '') {
     return { text: me === undefined ? 'comms: not joined. Run /comms-as <id>: maintainer, reviewer, or an agent name (e.g. frontend or 42); /comms-as off leaves.' : `comms: this session is ${me}. /comms-as off leaves.` }
   }
-  if (id === 'off') return { text: await leave($) }
+  if (id.toLowerCase() === 'off') return { text: await leave($) }
+  if (root === '') return { text: 'comms: there is no home folder (HOME is not set): set the Comms folder in /config first.' }
   let cfg = await loadConfig($)
   const allowed = knownIds(cfg)
   allowed.delete(REVIEWER)
@@ -1412,7 +1823,7 @@ const runCommsAs = async ($: Engine, e: CommandRunInput): Promise<CommandRunResu
   if (lookalike !== undefined) return { text: `"${id}" looks like a typo: did you mean /comms-as ${lookalike}?` }
   if (!isId(id) || (!allowed.has(id) && !isNewAgentId(id, cfg) && !isAnyReviewer)) {
     return {
-      text: `"${id}" is not an id this session can take: use maintainer, reviewer, or an agent name of letters, digits, - or _ (not "all", and not the name of a group).`,
+      text: `"${id}" is not an id this session can take: use maintainer, reviewer, or an agent name of letters, digits, - or _ (not "all" or "off" in any case, and not the name of a channel or group in another case).`,
     }
   }
   let registered = ''
@@ -1425,9 +1836,14 @@ const runCommsAs = async ($: Engine, e: CommandRunInput): Promise<CommandRunResu
       ? ` Registered ${id}: added channel #${id} (reviewer, ${id}) to channels.json and created ${made}${registration.notes > 0 ? ' with its setup note' : ''}.`
       : registration.notes > 0 ? ` Wrote the setup note in ${made}.` : ''
   }
-  if (id !== MAINTAINER && !isReviewer(id) && me !== id) await takeOverAgent($, id)
+  if (id !== MAINTAINER && !isReviewer(id) && me !== id) await quietly($, () => takeOverAgent($, id))
+  if (me !== id) generation += 1
   me = id
-  await $.store.set(identityKey(), id)
+  await quietly($, async () => {
+    await $.store.set(identityKey(), id)
+    await $.store.set(activeKey(), await $.clock.now())
+  })
+  $.ui.invalidate('ui.render')
   await join($)
   const where = cfg === undefined ? ' The folder is not set up yet: /comms-setup.' : ''
   const what = id === MAINTAINER
@@ -1440,7 +1856,7 @@ const runCommsAs = async ($: Engine, e: CommandRunInput): Promise<CommandRunResu
 }
 
 const runComms = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
-  if (!isPersonOrigin(e.origin)) return { text: '/comms is run by the person.' }
+  if (!(await isPersonOrigin($, e.origin))) return { text: '/comms is run by the person.' }
   if (me !== MAINTAINER) {
     return { text: `the pane is the maintainer's. ${me === undefined ? 'Run /comms-as maintainer first.' : `This session is ${me}; run /comms-as maintainer in your own session.`}` }
   }
@@ -1455,21 +1871,21 @@ const runComms = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult
 }
 
 const runCommsApprove = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
-  if (!isPersonOrigin(e.origin)) return { text: '/comms-approve is run by the person.' }
+  if (!(await isPersonOrigin($, e.origin))) return { text: '/comms-approve is run by the person.' }
   if (me !== MAINTAINER) return { text: 'approving is the maintainer\'s: run /comms-as maintainer first.' }
 
   return { text: await approveByCode($, e.args.trim().toLowerCase()) }
 }
 
 const runCommsGroup = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
-  if (!isPersonOrigin(e.origin)) return { text: '/comms-group is run by the person.' }
+  if (!(await isPersonOrigin($, e.origin))) return { text: '/comms-group is run by the person.' }
   if (sessionId === undefined) await init($)
 
   return { text: await createGroup($, e.args.trim().split(/[\s,]+/).filter(Boolean)) }
 }
 
 const runCommsSetup = async ($: Engine, e: CommandRunInput): Promise<CommandRunResult> => {
-  if (!isPersonOrigin(e.origin)) return { text: '/comms-setup is run by the person.' }
+  if (!(await isPersonOrigin($, e.origin))) return { text: '/comms-setup is run by the person.' }
   if (sessionId === undefined) await init($)
 
   return { text: await setup($) }
@@ -1502,7 +1918,11 @@ export const register: Register = (on, options) => {
 
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as Record<string, unknown>
-    if (e.tool === READ_FULL) return serveRead($, input)
+    if (e.tool === READ_FULL) {
+      // delivery belongs to the main conversation: a subagent reading would take its messages away from it
+      if (e.agentId !== undefined) return { deny: 'agent-comms: comms_read is for the main conversation; its messages are delivered there at its next step.' }
+      return serveRead($, input)
+    }
     if (e.tool === POST_FULL) return servePost($, input)
     const denied = await guard($, e)
     if (denied !== undefined) return { deny: denied }
@@ -1511,7 +1931,8 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    turnRunning = true
+    await quietly($, () => update($, turnAtom, () => e.turnId))
+    endOfTurnRows = new Map()
     if (me !== undefined && me !== MAINTAINER) {
       await scan($)
       if (hasUnread()) await deliver($)
@@ -1520,28 +1941,59 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // A main-loop step proves a turn is running (it also heals the state after a reload mid-turn).
+  // Rows appended here reach the model at the NEXT request; those appended at the last step are
+  // unread when the turn ends, and turn.complete wakes the session for them.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId === undefined && turnRunning && me !== MAINTAINER && hasUnread()) await deliver($)
+    if (e.agentId === undefined && me !== undefined && me !== MAINTAINER) {
+      if ((await read($, turnAtom)) !== e.turnId) await quietly($, () => update($, turnAtom, () => e.turnId))
+      endOfTurnRows = new Map()
+      if (hasUnread()) endOfTurnRows = await deliver($)
+    }
 
     return yield* next(e)
   })
 
-  on('turn.complete', ($, e, next) => {
-    if (e.agentId === undefined) turnRunning = false
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      await quietly($, () => update($, turnAtom, () => ''))
+      const unseen = endOfTurnRows
+      endOfTurnRows = new Map()
+      const self = me
+      if (self !== undefined && self !== MAINTAINER && config !== undefined && wakesFor(config, self) && [...unseen.values()].some(list => list.length > 0)) {
+        await wake($, unseen, 'above')
+      }
+    }
 
     return next(e)
   })
 
+  // A compaction takes delivered rows out of the conversation on purpose: they are no longer
+  // candidates for being sent again after a rewind.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && e.trigger !== 'precompute' && !('skip' in result)) await quietly($, () => $.store.set(recentKey(), []))
+
+    return result
+  })
+
   // ---- the pane --------------------------------------------------------
 
-  // The pane scrolls its messages itself so its header and boxes stay in place:
-  // the window never moves ({} without next); a wheel tick moves one message.
-  on('ui.scroll', { requestId: PANE }, async ($, e) => {
-    if (e.bodyRows < 12) return {}
-    const steps = Math.sign(e.by) * Math.max(1, Math.round(Math.abs(e.by) / 3))
+  // A pinned pane (12 rows or more) scrolls its messages itself so its header and boxes stay in
+  // place: the window never moves ({} without next); a wheel tick moves one message, and a
+  // scroll key moving a whole page (Home/End, PageUp/PageDown) jumps to the oldest or the latest.
+  // A shorter pane is not pinned: the engine's own window scrolls it.
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    if (e.bodyRows < 12) return next(e)
     // the channel the pane shows: the picked tab, else the first (as the render does)
     const chosen = (await read($, selectedAtom)) || (await read($, channelsAtom))[0]?.id || ''
     const length = Math.min(CHAT_SHOWN, ((await read($, threadsAtom))[chosen] ?? []).length)
+    const isJump = e.pointer === undefined && Math.abs(e.by) >= Math.max(e.bodyRows, e.contentRows)
+    if (isJump) {
+      await update($, skipAtom, () => (e.by < 0 ? Math.max(0, length - 1) : 0))
+      return {}
+    }
+    const steps = Math.sign(e.by) * Math.max(1, Math.round(Math.abs(e.by) / 3))
     await update($, skipAtom, skip => Math.max(0, Math.min(Math.max(0, length - 1), skip - steps)))
 
     return {}
@@ -1562,16 +2014,38 @@ export const register: Register = (on, options) => {
     const row = rows.find(r => r.id === chosen)
     const thread = threads[chosen] ?? []
     const recent = thread.slice(-CHAT_SHOWN)
-    // the pane scrolls its own messages under a fixed header: `skip` newest are below the window
-    const skip = Math.max(0, Math.min(skipWanted, recent.length - 1))
-    const shown = recent.slice(0, recent.length - skip)
     const bodyRows = e.props.scroll.bodyRows
     const isPinned = bodyRows >= 12
+    // the pane scrolls its own messages under a fixed header: `skip` newest are below the window
+    // (an unpinned pane is scrolled by the engine, so it never hides the newest)
+    const skip = isPinned ? Math.max(0, Math.min(skipWanted, recent.length - 1)) : 0
+    // The engine draws a drawing's first 100,000 characters and blanks the rest, so the messages
+    // drawn are chosen from the newest back within PANE_BUDGET: the newest and their buttons are
+    // always there, and scrolling up moves the window toward older ones.
+    const textOf = (m: CommsThreadItem): string => {
+      const isLong = m.length > PREVIEW_CHARS
+      const isOpen = m.pending || expanded.includes(m.id)
+      const full = fullBodies.get(m.id) ?? m.body
+      return isLong && !isOpen ? m.body : clip(full, EXPANDED_CHARS)
+    }
+    const end = recent.length - skip
+    let first = end
+    let used = 0
+    while (first > 0) {
+      const m = recent[first - 1]
+      if (m === undefined) break
+      const cost = (isSetupNote(m) ? 0 : textOf(m).length) + 400 + Math.min(2000, m.declined?.length ?? 0)
+      if (first < end && used + cost > PANE_BUDGET) break
+      used += cost
+      first -= 1
+    }
+    const shown = recent.slice(first, end)
     const totals = rows.reduce((t, r) => ({ pending: t.pending + r.pending, unread: t.unread + r.unread }), { pending: 0, unread: 0 })
     const summary = [totals.pending > 0 ? `⏳ ${totals.pending} to approve` : '', totals.unread > 0 ? `● ${totals.unread} new` : '']
       .filter(Boolean)
       .join(' · ') || 'all caught up'
-    const Input = 'Input' in table ? table.Input : undefined
+    // a surface with no Input (the phone) gets the buttons, never a box it cannot show
+    const Input = e.surface !== 'mobile' && 'Input' in table ? table.Input : undefined
     const nowMs = await $.clock.now()
 
     if (me !== MAINTAINER) {
@@ -1666,22 +2140,31 @@ export const register: Register = (on, options) => {
                     </Text>
                   </Box>
                   {(() => {
-                    const body = safeText(m.body, Number.MAX_SAFE_INTEGER)
-                    const isLong = body.length > PREVIEW_CHARS
+                    const isLong = m.length > PREVIEW_CHARS
                     const isOpen = expanded.includes(m.id)
-                    const parts = isLong && !isOpen ? [preview(body)] : chunks(body)
+                    const full = safeText(fullBodies.get(m.id) ?? m.body, Number.MAX_SAFE_INTEGER)
+                    // a message waiting for approval is drawn whole and verbatim: what is approved is exactly
+                    // the text the agent receives (Markdown hides some of it, a preview hides the rest)
+                    const parts = m.pending
+                      ? chunks(safeText(full, EXPANDED_CHARS))
+                      : isLong && !isOpen ? [preview(full)] : chunks(safeText(full, EXPANDED_CHARS))
+                    const cut = full.length > EXPANDED_CHARS && (m.pending || isOpen)
 
                     return (
                       <Box flexDirection="column">
-                        {parts.map((part, i) => (
-                          <Markdown key={`body:${m.id}:${i}`} text={part} />
-                        ))}
-                        {isLong && (
+                        {parts.map((part, i) =>
+                          m.pending ? <Text key={`body:${m.id}:${i}`}>{part}</Text> : <Markdown key={`body:${m.id}:${i}`} text={part} />)}
+                        {cut && (
+                          <Text key={`cut:${m.id}`} color="yellow">
+                            … {(full.length - EXPANDED_CHARS).toLocaleString('en')} more characters are not shown here; read the whole file before approving.
+                          </Text>
+                        )}
+                        {isLong && !m.pending && (
                           <Button
                             key={`more:${m.id}`}
                             plain
                             dimColor
-                            label={isOpen ? '▲ Show less' : `▼ Show full message (${body.length.toLocaleString('en')} characters)`}
+                            label={isOpen ? '▲ Show less' : `▼ Show full message (${m.length.toLocaleString('en')} characters)`}
                             onPress={() => {
                               void update($, expandedAtom, list =>
                                 list.includes(m.id) ? list.filter(x => x !== m.id) : [...list, m.id].slice(-50))
@@ -1713,9 +2196,9 @@ export const register: Register = (on, options) => {
                       />
                     </Box>
                   )}
-                  {m.pending && declining !== m.id && (
+                  {m.pending && (declining !== m.id || Input === undefined) && (
                     <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginTop={1} alignItems="center">
-                      <Text color="yellow">{m.held ? `⏸ On hold · ${m.from} and ${m.to} were told` : '⏳ Waiting for your approval'}</Text>
+                      <Text color="yellow">{m.held ? `⏸ On hold · ${m.from} and ${m.to === ALL ? 'the group' : m.to} were told` : '⏳ Waiting for your approval'}</Text>
                       <Button
                         key={`approve:${m.id}`}
                         variant="primary"
