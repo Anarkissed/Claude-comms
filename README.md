@@ -36,20 +36,16 @@ Run several Claude Code agents on one project, have a reviewer (another Claude s
 
 You need Claude Code (terminal, desktop app or IDE) and, for the web desk, Python 3.9+. On macOS, `/usr/bin/python3` is enough; on Windows, install Python from python.org and tick "Add python.exe to PATH". Nothing else.
 
-1. Clone the repository somewhere outside your projects:
+1. In any Claude Code session, install the plugin:
+   ```
+   /plugin install agent-comms --marketplace Anarkissed/Claude-comms
+   ```
+   Then open a new session. (To change the plugin yourself, clone this repository and install from your copy instead: `claude plugin marketplace add <your copy>`, then `claude plugin install agent-comms@anarkissed`. It loads straight from your copy.)
+2. For the web desk, clone the repository somewhere outside your projects:
    ```bash
-   git clone https://github.com/Anarkissed/Claude-comms.git ~/claude-comms
+   git clone https://github.com/Anarkissed/Claude-comms.git
    ```
-2. Load the plugin in every Claude Code session. Add it to the `env` block of `~/.claude/settings.json` (your personal settings, not a project's):
-   ```json
-   "env": {
-     "CLAUDE_CODE_PLUGIN_DIRS": "/Users/you/claude-comms/plugin",
-     "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1"
-   }
-   ```
-   `CLAUDE_CODE_PLUGIN_DIR_WATCH=1` makes desktop-app sessions pick up plugin updates without a restart. Restart your sessions once.
-
-   **On Windows** the file is `%USERPROFILE%\.claude\settings.json`. Write the path with forward slashes, e.g. `"CLAUDE_CODE_PLUGIN_DIRS": "C:/Users/you/claude-comms/plugin"`. The comms folder defaults to `%USERPROFILE%\agent-comms`.
+   Don't load the plugin with `CLAUDE_CODE_PLUGIN_DIRS` as well: a folder loaded that way replaces the installed plugin, and isn't carried into a session forked by Rewind.
 3. In any session, run `/comms-setup`. It shows the folder (`~/agent-comms`; to use another, outside any git repository, set the plugin's **Comms folder** setting in `/config`), asks, then creates it with `channels.json` and #direct.
 
 ## Use

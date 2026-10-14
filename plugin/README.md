@@ -8,12 +8,27 @@ Not affiliated with Anthropic. It's a Claude Code mod ("function hooks"), tested
 
 ## Install
 
-1. Get this folder: `git clone https://github.com/Anarkissed/Claude-comms` (the plugin is `Claude-comms/plugin`).
-2. Add it to the `env` block of `~/.claude/settings.json` (Windows: `%USERPROFILE%\.claude\settings.json`, forward slashes in the path):
-   ```json
-   "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/Claude-comms/plugin", "CLAUDE_CODE_PLUGIN_DIR_WATCH": "1" }
-   ```
-3. Restart your sessions (in the desktop app, open new Code sessions), then run `/comms-setup` once.
+In any Claude Code session (the desktop app's Code tab, the terminal or an IDE):
+
+```
+/plugin install agent-comms --marketplace Anarkissed/Claude-comms
+```
+
+Then start a new session and run `/comms-setup` once.
+
+**From a local copy** (to change the plugin yourself): clone the repository, then
+
+```bash
+claude plugin marketplace add /path/to/Claude-comms
+```
+
+```bash
+claude plugin install agent-comms@anarkissed
+```
+
+A plugin installed from a local folder loads from that folder, so your edits apply at each new session or `/reload-plugins`.
+
+Don't also load this folder with `CLAUDE_CODE_PLUGIN_DIRS` or `--plugin-dir`: a folder loaded that way replaces the installed plugin, and Claude Code doesn't carry it into a session forked by Rewind.
 
 ## Use
 
