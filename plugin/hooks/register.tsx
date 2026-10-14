@@ -115,6 +115,8 @@ const parent = (path: string): string => {
 
 // The module's own memory: a reload starts it over and the next scan rebuilds it.
 let sessionId: string | undefined
+/** The desktop app's session id, when the session runs in the desktop app. */
+let hostId: string | undefined
 let me: string | undefined
 let home = ''
 let root = ''
@@ -143,13 +145,20 @@ const paths = {
   declined: (ch: string) => `${root}/channels/${ch}/declined`,
 }
 
-const identityKey = () => `identity:${sessionId ?? 'unknown'}`
-const deliveredKey = (ch: string) => `delivered:${sessionId ?? 'unknown'}:${ch}`
+/**
+ * Who this session is to the store. The desktop app's session id
+ * (CLAUDE_CODE_HOST_SESSION_ID) lasts the life of a desktop session; the
+ * transcript id ($.session.id()) changes whenever the session goes on in a new
+ * transcript file, which once dropped an agent's identity on a restart.
+ */
+const owner = () => hostId ?? sessionId ?? 'unknown'
+const identityKey = () => `identity:${owner()}`
+const deliveredKey = (ch: string) => `delivered:${owner()}:${ch}`
 const seenKey = (ch: string) => `seen:maintainer:${ch}`
 /** The messages this session already announced (toast, phone notice), so a reload does not announce them again. */
-const notifiedKey = () => `notified:${sessionId ?? 'unknown'}`
+const notifiedKey = () => `notified:${owner()}`
 /** The messages that already woke this session. */
-const wokenKey = () => `woken:${sessionId ?? 'unknown'}`
+const wokenKey = () => `woken:${owner()}`
 
 const readWoken = async ($: Engine): Promise<Set<string>> => {
   const value = await $.store.get(wokenKey())
@@ -167,8 +176,56 @@ const init = async ($: Engine) => {
   windows = /^[A-Za-z]:\//.test(home)
   // the folder: the plugin's "Comms folder" setting (userConfig `folder`), else agent-comms in the home folder
   root = absolutize(folderOption !== '' ? folderOption : `${home}/agent-comms`, home || '/', home)
-  const stored = await $.store.get(identityKey())
+  const host = await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')
+  hostId = host !== undefined && host !== '' ? host : undefined
+  let stored = await $.store.get(identityKey())
+  if (stored === undefined && hostId !== undefined && sessionId !== undefined) stored = await adoptTranscriptRecords($, sessionId)
   me = typeof stored === 'string' && isId(stored) ? stored : undefined
+}
+
+/**
+ * Moves what the store holds under this session's transcript id (from before
+ * the desktop id was used) to the desktop id: its identity, and which messages
+ * were delivered, announced and used to wake it, so nothing is delivered twice.
+ * Returns the identity it moved, if any.
+ */
+const adoptTranscriptRecords = async ($: Engine, transcript: string): Promise<unknown> => {
+  const identity = await $.store.get(`identity:${transcript}`)
+  if (typeof identity !== 'string' || !isId(identity)) return undefined
+  await takeRecordsOf($, transcript)
+  await $.store.set(identityKey(), identity)
+  await $.store.delete(`identity:${transcript}`)
+
+  return identity
+}
+
+/** Adds an earlier owner's delivered, announced and woken lists to this session's own. */
+const takeRecordsOf = async ($: Engine, earlier: string) => {
+  if (earlier === owner()) return
+  const asList = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
+  for (const key of await $.store.keys()) {
+    const isTheirs = key.startsWith(`delivered:${earlier}:`) || key === `notified:${earlier}` || key === `woken:${earlier}`
+    if (!isTheirs) continue
+    const target = key.replace(earlier, owner())
+    const merged = new Set([...asList(await $.store.get(target)), ...asList(await $.store.get(key))])
+    await $.store.set(target, [...merged])
+  }
+}
+
+/**
+ * `/comms-as <agent>` in a new or restarted session: the agent's earlier
+ * sessions hand over what they delivered, so the agent isn't sent its whole
+ * history again, and their stale claim to the name is removed. A reviewer
+ * keeps its own semantics: a new reviewer chat receives what it hasn't seen.
+ */
+const takeOverAgent = async ($: Engine, id: string) => {
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith('identity:') || key === identityKey()) continue
+    if ((await $.store.get(key)) !== id) continue
+    const earlier = key.slice('identity:'.length)
+    await takeRecordsOf($, earlier)
+    await $.store.delete(key)
+  }
 }
 
 /** The root as realPath answers it; through its parent while the root is not there yet. */
@@ -1303,6 +1360,7 @@ const runCommsAs = async ($: Engine, e: CommandRunInput): Promise<CommandRunResu
       ? ` Registered ${id}: added channel #${id} (reviewer, ${id}) to channels.json and created ${made}${registration.notes > 0 ? ' with its setup note' : ''}.`
       : registration.notes > 0 ? ` Wrote the setup note in ${made}.` : ''
   }
+  if (id !== MAINTAINER && !isReviewer(id) && me !== id) await takeOverAgent($, id)
   me = id
   await $.store.set(identityKey(), id)
   await join($)

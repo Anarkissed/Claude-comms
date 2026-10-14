@@ -39,12 +39,14 @@ type World = {
   put: (path: string, text: string) => void
   /** Folders the mod made (.keep markers). */
   keeps: Set<string>
+  /** The plugin's $.store, as the test sees it. */
+  store: Map<string, unknown>
 }
 
 const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/'
 const nameOf = (p: string) => p.slice(p.lastIndexOf('/') + 1)
 
-const world = (on: On, options: { identity?: string; config?: unknown; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; store?: Record<string, unknown>; windows?: true } = {}): World => {
+const world = (on: On, options: { identity?: string; config?: unknown; surfaces?: ('terminal' | 'desktop' | 'mobile' | 'vscode')[]; store?: Record<string, unknown>; windows?: true; host?: string; sid?: string } = {}): World => {
   const files = new Map<string, string>()
   const dirs = new Set<string>(['/', '/w', HOME, CWD, 'C:', 'C:/Users', 'C:/Users/me', 'C:/work'])
   const root = options.windows ? WIN_ROOT : ROOT
@@ -84,15 +86,28 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     ran: [],
     put: (path, text) => put(path, text),
     keeps: undefined as unknown as Set<string>, // set just below
+    store: new Map(), // filled just below
   }
   let statusText: string | undefined
   w.keeps = keeps
 
   if (options.config !== null) put(`${root}/channels.json`, JSON.stringify(options.config ?? DEFAULT_CONFIG))
   w.clock = mock.clock(on, { now: T0 })
-  mock.store(on, { ...(options.identity ? { [`identity:${SID}`]: options.identity } : {}), ...(options.store ?? {}) })
+  // the plugin's store, in memory, readable by the test (w.store)
+  w.store = new Map(Object.entries({ ...(options.identity ? { [`identity:${SID}`]: options.identity } : {}), ...(options.store ?? {}) }))
+  on('store.get', ($, e) => ({ value: w.store.has(e.key) ? JSON.parse(JSON.stringify(w.store.get(e.key))) : undefined }))
+  on('store.set', ($, e) => {
+    w.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    w.store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...w.store.keys()] }))
   // the plugin reads only the home folder: USERPROFILE on Windows, HOME elsewhere
-  mock.env(on, options.windows ? { USERPROFILE: 'C:\\Users\\me' } : { HOME })
+  const hostEnv = options.host ? { CLAUDE_CODE_HOST_SESSION_ID: options.host } : {}
+  mock.env(on, options.windows ? { USERPROFILE: 'C:\\Users\\me', ...hostEnv } : { HOME, ...hostEnv })
 
   const listDir = (path: string): FsEntry[] => {
     const p = real(path)
@@ -190,7 +205,7 @@ const world = (on: On, options: { identity?: string; config?: unknown; surfaces?
     if (argv[0] === 'git') return { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository' }
     return { ...ok, exitCode: 127 }
   }
-  on('session.id', () => ({ value: SID }))
+  on('session.id', () => ({ value: options.sid ?? SID }))
   on('session.cwd', () => ({ value: options.windows ? 'C:\\work' : CWD }))
   on('prompt.submit', ($, e) => {
     w.prompts.push(e.text)
@@ -452,6 +467,43 @@ describe('5. tool.call guard', () => {
       await $.tool.call({ tool: 'Read', file_path: `${msgDir('358')}/${m.id}.json` }),
     ]
     for (const r of allowed) expect(denial(r)).toBeUndefined()
+  })
+
+  test('a desktop session keeps its identity when its transcript id changes (the #362 restart)', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'already had this one', nowMs: T0 - 5000, hex: 'old001' })
+    // joined and delivered under the desktop id; the restarted process has a new transcript id, S2
+    const w = world(on, { host: 'local_A', sid: 'S2', store: { 'identity:local_A': '358', 'delivered:local_A:358': [m.id] } })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    await start($)
+    await turn($, 1)
+    expect(w.tools).toContain('comms_post')
+    expect(w.appended.some(t => t.includes('already had this one'))).toBe(false)
+  })
+
+  test('records kept under the transcript id move to the desktop id, and nothing is delivered twice', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'delivered before the move', nowMs: T0 - 5000, hex: 'old002' })
+    const w = world(on, { host: 'local_A', store: { [`identity:${SID}`]: '358', [`delivered:${SID}:358`]: [m.id] } })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    await start($)
+    await turn($, 1)
+    expect(w.tools).toContain('comms_post')
+    expect(w.appended.some(t => t.includes('delivered before the move'))).toBe(false)
+    expect(w.store.get('identity:local_A')).toBe('358')
+    expect(w.store.has(`identity:${SID}`)).toBe(false)
+    expect(w.store.get('delivered:local_A:358')).toEqual([m.id])
+  })
+
+  test('/comms-as <agent> in a restarted session takes over its earlier record: nothing is sent twice', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'seen by the earlier session', nowMs: T0 - 5000, hex: 'old003' })
+    const w = world(on, { host: 'local_B', store: { 'identity:OLD': '358', 'delivered:OLD:358': [m.id], 'woken:OLD': [m.id] } })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    await start($)
+    const joined = await $.command.run({ command: 'comms-as', args: '358', ...PERSON })
+    expect(joined.text).toContain('this session is 358')
+    await turn($, 1)
+    expect(w.appended.some(t => t.includes('seen by the earlier session'))).toBe(false)
+    expect(w.store.has('identity:OLD')).toBe(false)
+    expect(w.store.get('delivered:local_B:358')).toContain(m.id)
   })
 
   test('the Comms folder setting places the folder; HOME/agent-comms is only the default', { options: { folder: '/w/elsewhere' } }, async ($, on) => {

@@ -1,6 +1,6 @@
 # Privacy policy: agent-comms (Claude-comms plugin)
 
-*Last updated: 10 October 2026*
+*Last updated: 14 October 2026*
 
 agent-comms is a Claude Code plugin. It runs entirely on your own computer, in Claude Code in the Claude desktop app, the terminal or an IDE. It has no server, account, analytics or telemetry, and the authors receive no data of any kind.
 
@@ -10,7 +10,7 @@ All of it stays on your computer:
 
 - **The comms folder** (`agent-comms` in your home folder by default, or the plugin's **Comms folder** setting): `channels.json`, message files (`channels/<channel>/messages/*.json`), approval and decline records, and empty `.keep` files that mark folders. Messages hold whatever the agents, the reviewer and you write in them.
 - **Claude Code's own store for this plugin** (a JSON file in your Claude Code configuration folder): which identity each session took, and which messages were already delivered or announced, so nothing is delivered twice.
-- **Environment variables** it reads: `HOME` or `USERPROFILE`, only to place the default folder. It reads no credentials and writes no variables.
+- **Environment variables** it reads: `HOME` or `USERPROFILE`, only to place the default folder, and `CLAUDE_CODE_HOST_SESSION_ID`, so a desktop session keeps its identity across restarts. It reads no credentials and writes no variables.
 - **Programs:** it runs none.
 
 The plugin reads no names, emails, addresses, credentials or other files, and it uses no connectors or MCP servers.
