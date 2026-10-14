@@ -61,20 +61,23 @@ Nothing leaves your computer through the plugin itself. The only way its data mo
 
 - **The comms folder:** `channels.json` and the message, approval and decline files in it.
 - **Its own store** (`$.store`): each session's identity, and the ids of messages already delivered, announced, held or used to wake it. In the desktop app these are kept under the app's session id, which lasts across restarts; in a terminal, under the transcript id. `/comms-as <agent>` takes over the records of that agent's earlier sessions, so nothing is delivered twice.
-- **Its earlier store file:** when installed from a marketplace, it reads the store it kept while loaded as a folder (`~/.claude/plugins/store/agent-comms_inline-*.json`) at each start, to carry a session's identity and delivery record over. It never writes or deletes that file.
+- **Its earlier store file:** when installed from a marketplace, it lists Claude Code's plugin store folder (`~/.claude/plugins/store/`) to find the store it kept while loaded as a folder (`agent-comms_inline-*.json`), and reads only that file, at each start and at `/comms-as <agent>`, to carry a session's identity and delivery record over. It never writes or deletes that file, and reads no other file there.
 - **The conversation:** only through its own tools' calls (`comms_read`, `comms_post`) and the tool calls its guard checks. It reads no other files.
-- **Environment:** `HOME` (macOS, Linux) or `USERPROFILE` (Windows), only to place the default comms folder; `CLAUDE_CODE_HOST_SESSION_ID`, the desktop app's id for the session, so a session keeps its identity when it restarts; and `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION`, only to tell that it is a `claude` started from another session's shell, which must not take that session's identity. It reads no credentials, tokens or keys.
-- **The conversation's rows** (`$.session.messages()`), only when a desktop session comes back under a new transcript (a Rewind): a message the rewind took out of the conversation is delivered again.
+- **Environment:** `HOME` (macOS, Linux) or `USERPROFILE` (Windows), to place the default comms folder, to expand `~` in the Comms folder setting and in the paths and commands its guard checks, and to find its earlier store file; `CLAUDE_CODE_HOST_SESSION_ID`, the desktop app's id for the session, so a session keeps its identity when it restarts; and `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION`, only to tell that it is a `claude` started from another session's shell, which must not take that session's identity. It reads no credentials, tokens or keys (see [Credentials](#credentials)).
+- **The conversation's rows** (`$.session.messages()`), when the conversation may have been rewound: when a desktop session comes back under a new transcript, and at the start of every turn that adds no new prompt of yours (a rewind looks like that: the count of your prompts goes down or stays the same; so does a turn started by a task notification, another session or the plugin's own wake prompt). It looks only for its own delivery headers there, and a message a rewind took out of the conversation is delivered again. Nothing it reads there is written, shown or sent anywhere.
+
+### Credentials
+
+The plugin reads no credentials: no API keys, tokens, passwords, cookies, SSH or cloud keys, and not Claude Code's own login. `CLAUDE_CODE_HOST_SESSION_ID` is not a secret: it's the desktop app's identifier for a session, the same for every restart of that session. The plugin uses it only as a key in its own local store, to find the identity the session took; it never writes it to the comms folder, never puts it in a prompt or a message, and never sends it anywhere (the plugin makes no network requests). `CLAUDECODE` and `CLAUDE_CODE_CHILD_SESSION` are read only to see whether they are set.
 
 ### What it writes
 
-Only inside the comms folder, with the file API (`$.fs.write`):
+Only inside the comms folder, with the file API (`$.fs.write`), and only these paths:
 
-- `channels.json`, when `/comms-setup`, `/comms-as <new agent>` or `/comms-group` adds a channel (existing entries are kept);
-- one new JSON file per message in `channels/<channel>/messages/`, and per approval, decline or hold in `approvals/`, `declined/` and `held/`; none is ever edited or deleted, except that an approval or decline file that does not parse (half written, or not the maintainer's) is replaced by the maintainer's own;
-- empty `.keep` files, which create the folders.
+- `<comms folder>/channels.json`, when `/comms-setup`, `/comms-as <new agent>` or `/comms-group` adds a channel (existing entries are kept);
+- `<comms folder>/channels/<channel>/messages/<id>.json`, one new file per message, and `.../approvals/<id>.json`, `.../declined/<id>.json` and `.../held/<id>.json`, one per approval, decline or hold. None is ever deleted. A message is never edited; a hold record is rewritten as its notes go out, and an approval or decline file that does not parse (half written, or not the maintainer's) is replaced by the maintainer's own.
 
-It never writes build, start-up, settings or instruction files, and it refuses to create the comms folder inside a git repository (it checks for a `.git` entry in the folder and the folders above it). A reader that catches a file mid-write sees JSON that doesn't parse yet; the plugin reads it again once it's complete.
+`<comms folder>` is the **Comms folder** setting, or `agent-comms` in your home folder, and `<id>` is a time stamp, the sender and six random hex characters. A channel's folders come into being with its first file. The plugin is not meant to edit any build, start-up, settings or instruction file, and never does: it writes nothing outside the comms folder (its own store aside, which Claude Code keeps), and it refuses to create the comms folder inside a git repository (it checks for a `.git` entry in the folder and the folders above it). A reader that catches a file mid-write sees JSON that doesn't parse yet; the plugin reads it again once it's complete.
 
 ### Programs it runs
 
@@ -95,12 +98,17 @@ Text added to a conversation is sent to Anthropic as part of that conversation, 
   ```
   `<tag>` is 12 random hex characters, new for every delivery, so nothing a sender writes can pass for the end of the message or for another, approved one.
   ```
-- **The auto-wake prompt** (`$.prompt.submit`), only when such a message arrives while the session is idle, once per message. Never to your own (maintainer) session, and never if `"auto_wake": false` is set in `channels.json` or the session ran `/comms-as off`:
+- **The auto-wake prompt** (`$.prompt.submit`), the only prompt the plugin ever submits (see [Prompts it submits](#prompts-it-submits)), only when such a message arrives while the session is idle, once per message. Never to your own (maintainer) session, and never if `"auto_wake": false` is set in `channels.json` or the session ran `/comms-as off`:
   ```
   A new agent-comms message for you on #<channel> (from <sender>). It follows this note; read it, act on it as your work allows, and reply with comms_post.
   ```
   When the message arrived at the very last step of a turn (so the model has not read it), the prompt comes when the turn ends and says instead: `It reached you at the end of your last turn and is just above this note`.
 - **Tool results** of `comms_read` and `comms_post`, which the model calls itself.
+- **Refusals**, as the result of a tool call the plugin refuses, which the model reads: `agent-comms: <comms folder> is written only through the comms tools …` when a tool call would write to the comms folder another way (it names the folder's path); `agent-comms: /comms, /comms-as and /comms-setup are run by the person, not by the model.` when the model tries to run those commands; and `comms_read is for the main conversation …` when a subagent calls `comms_read`.
+
+### Prompts it submits
+
+One kind only: the auto-wake prompt above, submitted to the session the message is addressed to, so that an idle agent reads it. Its whole text is built from three things: how many new messages there are (`A new agent-comms message` or `<n> new agent-comms messages`), the channel names (`#358`) and the senders' ids (`reviewer`), plus the fixed wording shown above. It never contains a message's text, anything from the conversation, file contents, paths, the session id or anything else the plugin reads. Claude reads it as a note from the agent-comms mod, not as your words (it is not sent `asUser`). The message itself reaches the conversation separately, as the delivered row above.
 
 ### What each hook does
 
@@ -113,6 +121,7 @@ Text added to a conversation is sent to Anthropic as part of that conversation, 
 | `turn.start`, `turn.step` | Delivers waiting messages at the start of a turn or between steps, never in the middle of a tool call |
 | `turn.complete` | Notes that the turn has ended, so the session counts as idle and may be woken; wakes it for a message that arrived at the turn's last step |
 | `session.compact` | Notes a compaction, after which delivered messages are no longer candidates for being sent again after a rewind |
+| `session.end` | On `/clear`, forgets which delivered messages could be sent again after a rewind (the conversation is empty) and looks at the folder again 1.5 s later, under the new transcript. It changes nothing else |
 | `ui.render` (Pane) | Draws your `/comms` pane |
 | `ui.scroll` (Pane) | Scrolls the messages inside that pane so its header and text box stay in place (Home/End jump to the oldest/latest; a pane under 12 rows scrolls normally). It only changes which messages the pane shows |
 | Status line and toasts | `comms #358: 1 new` and similar notices, on your screen only |
@@ -123,4 +132,4 @@ Questions and bugs: [GitHub issues](https://github.com/Anarkissed/Claude-comms/i
 
 ## Development
 
-`claude plugin validate --strict .` and `claude plugin test .` (181 tests, including Windows paths). Needs Claude Code 2.1.293 or later.
+`claude plugin validate --strict .` and `claude plugin test .` (184 tests, including Windows paths). Needs Claude Code 2.1.293 or later to run. Validated with Claude Code 2.1.295 (`--strict`) and 2.1.278 (whose only warnings are the directory listing fields, which it doesn't know yet).

@@ -1,4 +1,3 @@
-import { atom, read, update } from 'claude-code'
 import type { CommandRunInput, CommandRunResult, EngineInterface, Register, Timer, ToolCallInput, ToolCallResult } from 'claude-code'
 
 import type { CommsChannelRow, CommsThreadItem } from '../types'
@@ -68,19 +67,97 @@ const POST_TOOL = 'comms_post'
 const READ_FULL = `mcp__${PLUGIN}__${READ_TOOL}`
 const POST_FULL = `mcp__${PLUGIN}__${POST_TOOL}`
 
-const channelsAtom = atom({ plugin: 'agent-comms', key: 'channels' } as const, [])
-const threadsAtom = atom({ plugin: 'agent-comms', key: 'threads' } as const, {})
-const selectedAtom = atom({ plugin: 'agent-comms', key: 'selected' } as const, '')
-const infoAtom = atom({ plugin: 'agent-comms', key: 'info' } as const, '')
-const decliningAtom = atom({ plugin: 'agent-comms', key: 'declining' } as const, '')
-const expandedAtom = atom({ plugin: 'agent-comms', key: 'expanded' } as const, [])
-const skipAtom = atom({ plugin: 'agent-comms', key: 'skip' } as const, 0)
-const focusAtom = atom({ plugin: 'agent-comms', key: 'focus' } as const, '')
+// The pane's values, kept in $.state (declared in types/index.d.ts). Each has its own get and set, with
+// its { plugin, key } written out in full at the call, as the mods API reads it.
+
+async function getChannels($: Engine): Promise<CommsChannelRow[]> {
+  const { value = [] } = await $.state.get({ plugin: 'agent-comms', key: 'channels' })
+  return value
+}
+async function setChannels($: Engine, value: CommsChannelRow[]): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'channels' }, value)
+}
+async function getThreads($: Engine): Promise<Record<string, CommsThreadItem[]>> {
+  const { value = {} } = await $.state.get({ plugin: 'agent-comms', key: 'threads' })
+  return value
+}
+async function setThreads($: Engine, value: Record<string, CommsThreadItem[]>): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'threads' }, value)
+}
+async function getSelected($: Engine): Promise<string> {
+  const { value = '' } = await $.state.get({ plugin: 'agent-comms', key: 'selected' })
+  return value
+}
+async function setSelected($: Engine, value: string): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'selected' }, value)
+}
+async function getInfo($: Engine): Promise<string> {
+  const { value = '' } = await $.state.get({ plugin: 'agent-comms', key: 'info' })
+  return value
+}
+async function setInfo($: Engine, value: string): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'info' }, value)
+}
+async function getDeclining($: Engine): Promise<string> {
+  const { value = '' } = await $.state.get({ plugin: 'agent-comms', key: 'declining' })
+  return value
+}
+async function setDeclining($: Engine, value: string): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'declining' }, value)
+}
+async function getExpanded($: Engine): Promise<string[]> {
+  const { value = [] } = await $.state.get({ plugin: 'agent-comms', key: 'expanded' })
+  return value
+}
+async function setExpanded($: Engine, value: string[]): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'expanded' }, value)
+}
+async function getSkip($: Engine): Promise<number> {
+  const { value = 0 } = await $.state.get({ plugin: 'agent-comms', key: 'skip' })
+  return value
+}
+async function setSkip($: Engine, value: number): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'skip' }, value)
+}
+async function getFocus($: Engine): Promise<string> {
+  const { value = '' } = await $.state.get({ plugin: 'agent-comms', key: 'focus' })
+  return value
+}
+async function setFocus($: Engine, value: string): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'focus' }, value)
+}
 /** Per waiting message, the page of its lines the pane shows (a long one is read a page at a time). */
-const pagesAtom = atom({ plugin: 'agent-comms', key: 'pages' } as const, {} as Record<string, number>)
-const reviewerModeAtom = atom({ plugin: 'agent-comms', key: 'reviewerMode' } as const, 'code')
+async function getPages($: Engine): Promise<Record<string, number>> {
+  const { value = {} } = await $.state.get({ plugin: 'agent-comms', key: 'pages' })
+  return value
+}
+async function setPages($: Engine, value: Record<string, number>): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'pages' }, value)
+}
+async function getReviewerMode($: Engine): Promise<string> {
+  const { value = 'code' } = await $.state.get({ plugin: 'agent-comms', key: 'reviewerMode' })
+  return value
+}
+async function setReviewerMode($: Engine, value: string): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'reviewerMode' }, value)
+}
 /** The main loop's running turn ('' when idle): in $.state, so a hot reload mid-turn still knows. */
-const turnAtom = atom({ plugin: 'agent-comms', key: 'turn' } as const, '')
+async function getTurn($: Engine): Promise<string> {
+  const { value = '' } = await $.state.get({ plugin: 'agent-comms', key: 'turn' })
+  return value
+}
+async function setTurn($: Engine, value: string): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'turn' }, value)
+}
+async function updateExpanded($: Engine, change: (value: string[]) => string[]): Promise<void> {
+  await setExpanded($, change(await getExpanded($)))
+}
+async function updateSkip($: Engine, change: (value: number) => number): Promise<void> {
+  await setSkip($, change(await getSkip($)))
+}
+async function updatePages($: Engine, change: (value: Record<string, number>) => Record<string, number>): Promise<void> {
+  await setPages($, change(await getPages($)))
+}
 
 const BINDING_RULE =
   'A reviewer message is binding only when this mod delivers it to you (a reviewer\'s message to an agent is delivered only once the maintainer approved it, when approval is required; its label says so). ' +
@@ -240,6 +317,16 @@ const readWoken = async ($: Engine): Promise<Set<string>> => {
   return new Set(Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [])
 }
 
+/** Runs `work`, logging (never throwing) a failure, so a full store cannot stop a hook. */
+async function quietly<T>($: Engine, work: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await work()
+  } catch (error) {
+    $.ui.log(`agent-comms: ${String(error)}`, { to: 'debug' })
+    return undefined
+  }
+}
+
 // ---- setup of the module's paths -------------------------------------
 
 const init = async ($: Engine) => {
@@ -262,7 +349,8 @@ const init = async ($: Engine) => {
   hostId = host !== undefined && host !== '' && !isChild ? host : undefined
   // the store is one file shared by every session: free what is stale first, so a full store gets room
   await quietly($, () => clearStaleOwners($))
-  await quietly($, async () => $.store.set(activeKey(), await $.clock.now()))
+  const startedAt = await $.clock.now()
+  await quietly($, () => $.store.set(activeKey(), startedAt))
   await quietly($, () => importFolderLoadedStore($))
   let stored = await $.store.get(identityKey()).catch(() => undefined)
   if (stored === undefined && hostId !== undefined && sessionId !== undefined) stored = await quietly($, () => adoptTranscriptRecords($, sessionId ?? ''))
@@ -276,16 +364,6 @@ const init = async ($: Engine) => {
     // what the fork cut out of the conversation is delivered again
     if (hostId !== undefined && me !== undefined && typeof lastTranscript === 'string' && lastTranscript !== sessionId) await recheckDeliveries($)
   })
-}
-
-/** Runs `work`, logging (never throwing) a failure, so a full store cannot stop a hook. */
-const quietly = async <T,>($: Engine, work: () => Promise<T>): Promise<T | undefined> => {
-  try {
-    return await work()
-  } catch (error) {
-    $.ui.log(`agent-comms: ${String(error)}`, { to: 'debug' })
-    return undefined
-  }
 }
 
 /**
@@ -611,19 +689,6 @@ const listSafe = async ($: Engine, dir: string) => {
 }
 
 /**
- * Creates folders with no command at all: a hidden `.keep` file in each
- * (writing creates the folders on the way). Readers skip dot-files.
- */
-const ensureDirs = async ($: Engine, dirs: readonly string[]): Promise<string | undefined> => {
-  try {
-    for (const dir of dirs) if (!(await $.fs.exists(`${dir}/.keep`))) await $.fs.write(`${dir}/.keep`, '')
-    return undefined
-  } catch (error) {
-    return String(error)
-  }
-}
-
-/**
  * Writes `name` in `dir` with the file API alone; the plugin runs no programs.
  * Never replaces an existing file unless `replace` (channels.json). A reader
  * that catches a file mid-write finds JSON that does not parse yet: messages
@@ -918,7 +983,7 @@ const scanAsAgent = async ($: Engine, cfgIn: Config, self: string, gen: number) 
   }
   unread = next
   $.ui.status(agentStatus(mine))
-  const isBusy = (await read($, turnAtom)) !== ''
+  const isBusy = (await getTurn($)) !== ''
   if (wakesFor(cfg, self) && !isBusy && !heldByPerson) await wake($, next, 'follow', gen, self)
 }
 
@@ -1074,9 +1139,9 @@ const scanAsMaintainer = async ($: Engine, cfg: Config, gen: number) => {
     if (longest === undefined || longest[1].length <= 1) break
     threads[longest[0]] = longest[1].slice(Math.ceil(longest[1].length / 4))
   }
-  await update($, channelsAtom, () => rows)
-  await update($, threadsAtom, () => threads)
-  await update($, reviewerModeAtom, () => cfg.reviewer_mode)
+  await setChannels($, rows)
+  await setThreads($, threads)
+  await setReviewerMode($, cfg.reviewer_mode)
   if (gen !== generation || me !== MAINTAINER) return
   $.ui.status(pendingAll > 0 ? `comms: ${pendingAll} awaiting approval (/comms)` : 'comms (maintainer): nothing awaiting approval')
 }
@@ -1373,7 +1438,7 @@ const servePost = async ($: Engine, input: Record<string, unknown>): Promise<Too
 
 /** "Not … : this session is not the maintainer", shown where the press was. */
 const notMaintainer = async ($: Engine) =>
-  update($, infoAtom, () => 'This session is no longer the maintainer: run /comms-as maintainer.')
+  setInfo($, 'This session is no longer the maintainer: run /comms-as maintainer.')
 
 /** Runs a maintainer action once at a time per message: a double press while one runs does nothing. */
 const once = async <T,>(key: string, work: () => Promise<T>): Promise<T | undefined> => {
@@ -1411,7 +1476,7 @@ const approve = async ($: Engine, ch: string, id: string): Promise<string> => {
       ? `✓ Approved ${found.from}'s ${found.kind} to ${found.to}; it reaches ${found.to} at its next step.`
       : `Approval not written: ${written.reason}`
   })) ?? 'Already approving that message.'
-  await update($, infoAtom, () => outcome)
+  await setInfo($, outcome)
   await scan($)
 
   return outcome
@@ -1614,7 +1679,7 @@ const hold = async ($: Engine, ch: string, id: string) => {
 const holdOnce = async ($: Engine, ch: string, id: string) => {
   const found = await findWaiting($, ch, id)
   if ('reason' in found) {
-    await update($, infoAtom, () => `Not held: ${found.reason}`)
+    await setInfo($, `Not held: ${found.reason}`)
     return
   }
   const { m, scanned } = found
@@ -1635,7 +1700,7 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
     const age = at === undefined ? undefined : (await $.clock.now()) - at
     const marks = await heldMarks($, ch, id)
     if (unfinished && !marks.failed && age !== undefined && age >= 0 && age < 30_000) {
-      await update($, infoAtom, () => 'That hold is being sent from another desk right now; press Hold again in a moment if it does not finish.')
+      await setInfo($, 'That hold is being sent from another desk right now; press Hold again in a moment if it does not finish.')
       return
     }
     if (unfinished) {
@@ -1644,26 +1709,26 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
       const claim = randomHex(6)
       const claimed = await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, told, false, claim), true)
       if (!claimed.ok) {
-        await update($, infoAtom, () => `Not held: ${claimed.reason}`)
+        await setInfo($, `Not held: ${claimed.reason}`)
         return
       }
       await $.clock.sleep(HOLD_CLAIM_SETTLE_MS)
       if ((await heldMarks($, ch, id)).claim !== claim) {
-        await update($, infoAtom, () => 'That hold is being finished from another desk right now.')
+        await setInfo($, 'That hold is being finished from another desk right now.')
         return
       }
     }
   } else {
     const claim = await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, []))
     if (!claim.ok) {
-      await update($, infoAtom, () => claim.reason.endsWith('already exists') ? `Already on hold.` : `Not held: ${claim.reason}`)
+      await setInfo($, claim.reason.endsWith('already exists') ? `Already on hold.` : `Not held: ${claim.reason}`)
       return
     }
     told = []
   }
   const missing = recipients.filter(r => !told.includes(r))
   if (missing.length === 0) {
-    await update($, infoAtom, () => `Already on hold; ${m.from} and ${m.to === ALL ? 'the group' : m.to} were told.`)
+    await setInfo($, `Already on hold; ${m.from} and ${m.to === ALL ? 'the group' : m.to} were told.`)
     return
   }
   const noteFor = (r: string): string =>
@@ -1695,7 +1760,7 @@ const holdOnce = async ($: Engine, ch: string, id: string) => {
     told = [...told, r]
     await writeAtomic($, paths.held(ch), `${id}.json`, formatHeld(id, ts, told), true)
   }
-  await update($, infoAtom, () =>
+  await setInfo($,
     failed !== undefined
       ? failed === 'it was declined meanwhile'
         ? 'Not held further: it was declined meanwhile.'
@@ -1727,8 +1792,8 @@ const decline = async ($: Engine, ch: string, id: string, reason: string) => {
 const declineOnce = async ($: Engine, ch: string, id: string, reason: string) => {
   const found = await findWaiting($, ch, id)
   if ('reason' in found) {
-    await update($, infoAtom, () => `Not declined: ${found.reason}`)
-    await update($, decliningAtom, () => '')
+    await setInfo($, `Not declined: ${found.reason}`)
+    await setDeclining($, '')
     return
   }
   const { m, scanned } = found
@@ -1738,7 +1803,7 @@ const declineOnce = async ($: Engine, ch: string, id: string, reason: string) =>
   const replace = scanned.unreadableRecords.has(id) && (await $.fs.exists(`${paths.declined(ch)}/${id}.json`))
   const recorded = await writeAtomic($, paths.declined(ch), `${id}.json`, formatDecline({ id, by: MAINTAINER, ts, reason: why }), replace)
   if (!recorded.ok) {
-    await update($, infoAtom, () => `Not declined: ${recorded.reason}`)
+    await setInfo($, `Not declined: ${recorded.reason}`)
     return
   }
   const agentRecipient = m.to === ALL ? ALL : m.to
@@ -1761,9 +1826,9 @@ const declineOnce = async ($: Engine, ch: string, id: string, reason: string) =>
   const toAgent = wasHeld
     ? await postNote($, ch, m.to, `Declined: the ${m.kind} from ${m.from} that was on hold was declined. Nothing is coming; carry on with your work.`)
     : ({ ok: true } as const)
-  await update($, decliningAtom, () => '')
+  await setDeclining($, '')
   const failed = !toReviewer.ok ? toReviewer : !toAgent.ok ? toAgent : undefined
-  await update($, infoAtom, () =>
+  await setInfo($,
     failed !== undefined
       ? `Declined, but a note was not written: ${failed.reason}`
       : wasHeld
@@ -1783,12 +1848,12 @@ const postAsMaintainer = async ($: Engine, ch: string, to: string, value: string
   const channel = cfg?.channels.find(c => c.id === ch)
   // a named reviewer (Reviewer3) is a member of every channel with a reviewer slot
   if (channel === undefined || to === MAINTAINER || !(memberOf(channel, to) || (to === ALL && isGroup(channel)))) {
-    await update($, infoAtom, () => `Not posted: ${to} is not in #${ch}.`)
+    await setInfo($, `Not posted: ${to} is not in #${ch}.`)
     return
   }
   const message = newMessage({ from: MAINTAINER, to, kind, body, nowMs: await $.clock.now() })
   const written = await writeAtomic($, paths.messages(ch), `${message.id}.json`, format(message))
-  await update($, infoAtom, () =>
+  await setInfo($,
     written.ok ? `Posted ${kind} to ${to} on #${ch}.` : `Not posted: ${written.reason}`)
   await markSeen($, ch)
   await scan($)
@@ -1887,13 +1952,11 @@ const setup = async ($: Engine): Promise<string> => {
   if (!result.ok) return `channels.json not written: ${result.reason}`
   if (changed && hadConfig) created.push('merged channels.json')
   cfg = result.cfg
-  const dirs = cfg.channels.flatMap(c => [paths.messages(c.id), paths.approvals(c.id)])
-  const failed = await ensureDirs($, dirs)
-  if (failed !== undefined) return `could not create the channel folders: ${failed}`
-  created.push(`${dirs.length} channel folders`)
   realRoot = undefined
 
-  const notes = await writeSetupNotes($, cfg, cfg.channels)
+  // a channel's folders come into being with its first file: the setup note written here
+  const { notes, failed } = await writeSetupNotes($, cfg, cfg.channels)
+  if (failed !== undefined) return `could not create the channel folders: ${failed}`
   created.push(`${notes} setup note${notes === 1 ? '' : 's'}`)
   config = cfg
   if (me !== undefined) await scan($)
@@ -1902,8 +1965,9 @@ const setup = async ($: Engine): Promise<string> => {
 }
 
 /** One maintainer setup note per channel that has none yet; returns how many were written. */
-const writeSetupNotes = async ($: Engine, cfg: Config, channels: readonly Channel[]): Promise<number> => {
+const writeSetupNotes = async ($: Engine, cfg: Config, channels: readonly Channel[]): Promise<{ notes: number; failed?: string }> => {
   let notes = 0
+  let failed: string | undefined
   for (const channel of channels) {
     const scanned = await scanChannel($, channel)
     if (scanned.messages.some(m => m.from === MAINTAINER && m.kind === 'note' && m.body.startsWith(setupNoteMarker))) continue
@@ -1917,9 +1981,11 @@ const writeSetupNotes = async ($: Engine, cfg: Config, channels: readonly Channe
     })
     const written = await writeAtomic($, paths.messages(channel.id), `${note.id}.json`, format(note))
     if (written.ok) notes += 1
+    // the note is what creates a new channel's folder: a note not written is a folder not made
+    else failed ??= `channels/${channel.id}/: ${written.reason}`
   }
 
-  return notes
+  return { notes, ...(failed !== undefined ? { failed } : {}) }
 }
 
 /**
@@ -1950,9 +2016,9 @@ const createGroup = async ($: Engine, args: readonly string[]): Promise<string> 
   const cfg = result.cfg
   const group = cfg.channels.find(c => c.id === name)
   if (group === undefined) return 'channels.json kept changing; the group was not added. Try again.'
-  const failed = await ensureDirs($, [paths.messages(name), paths.approvals(name)])
+  // the group's folder comes into being with its setup note
+  const { failed } = await writeSetupNotes($, cfg, [group])
   if (failed !== undefined) return `Could not create the group's folders: ${failed}`
-  await writeSetupNotes($, cfg, [group])
   if (me !== undefined) await scan($)
 
   return `Group #${name} is ready: ${group.members.join(', ')}. Messages to "all" reach everyone in it; each agent sees it beside its own channel.`
@@ -1992,10 +2058,11 @@ type AgentRegistration =
   | { ok: false; reason: string }
 
 /**
- * Makes sure agent `id` has a channel and its folders: adds
+ * Makes sure agent `id` has a channel and its folder: adds
  * {id, members: [reviewer, id]} to channels.json when no channel lists it
- * (every other field and channel kept), creates messages/ and approvals/ for
- * each of its channels, and writes the setup note where there is none.
+ * (every other field and channel kept), and writes the setup note where there
+ * is none, which creates the channel's messages/ folder (the others come with
+ * their first record).
  * channels.json is re-read after the write and the add retried, so two
  * sessions registering at once do not drop each other's channel.
  */
@@ -2018,10 +2085,9 @@ const registerAgent = async ($: Engine, id: string): Promise<AgentRegistration> 
   const cfg = result.cfg
   const mine = channelsFor(cfg, id)
   if (mine.length === 0) return { ok: false, reason: `channels.json kept changing; ${id} was not added. Try again.` }
-  const dirs = mine.flatMap(c => [paths.messages(c.id), paths.approvals(c.id)])
-  const failed = await ensureDirs($, dirs)
+  // a channel's folders come into being with its first file (the setup note)
+  const { notes, failed } = await writeSetupNotes($, cfg, mine)
   if (failed !== undefined) return { ok: false, reason: `could not create the channel folders: ${failed}` }
-  const notes = await writeSetupNotes($, cfg, mine)
 
   return { ok: true, added, channels: mine, notes }
 }
@@ -2141,10 +2207,10 @@ const shortCode = (id: string): string => {
 const openChannel = async ($: Engine, ch: string, thread: readonly CommsThreadItem[]) => {
   const recent = thread.slice(-CHAT_SHOWN)
   const target = recent.findIndex(m => m.fresh) >= 0 ? recent.findIndex(m => m.fresh) : recent.findIndex(m => m.pending)
-  await update($, selectedAtom, () => ch)
-  await update($, infoAtom, () => '')
-  await update($, focusAtom, () => (target >= 0 ? recent[target]?.id ?? '' : ''))
-  await update($, skipAtom, () => (target >= 0 ? recent.length - 1 - target : 0))
+  await setSelected($, ch)
+  await setInfo($, '')
+  await setFocus($, (target >= 0 ? recent[target]?.id ?? '' : ''))
+  await setSkip($, (target >= 0 ? recent.length - 1 - target : 0))
   await markSeen($, ch)
   await scan($)
 }
@@ -2344,7 +2410,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    await quietly($, () => update($, turnAtom, () => e.turnId))
+    await quietly($, () => setTurn($, e.turnId))
     endOfTurnRows = new Map()
     heldByPerson = false
     // the transcript may have changed with no session.start (/clear, /resume), joined or not; a poll
@@ -2370,7 +2436,7 @@ export const register: Register = (on, options) => {
   // unread when the turn ends, and turn.complete wakes the session for them.
   on('turn.step', async function* ($, e, next) {
     if (e.agentId === undefined && me !== undefined && me !== MAINTAINER) {
-      if ((await read($, turnAtom)) !== e.turnId) await quietly($, () => update($, turnAtom, () => e.turnId))
+      if ((await getTurn($)) !== e.turnId) await quietly($, () => setTurn($, e.turnId))
       // from the second request on, every row appended before it is in it
       if (e.index > 0) endOfTurnRows = new Map()
       if (hasUnread()) {
@@ -2383,7 +2449,7 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
-      await quietly($, () => update($, turnAtom, () => ''))
+      await quietly($, () => setTurn($, ''))
       const unseen = endOfTurnRows
       endOfTurnRows = new Map()
       const self = me
@@ -2429,15 +2495,15 @@ export const register: Register = (on, options) => {
   on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
     if (e.bodyRows < 12) return next(e)
     // the channel the pane shows: the picked tab, else the first (as the render does)
-    const chosen = (await read($, selectedAtom)) || (await read($, channelsAtom))[0]?.id || ''
-    const length = Math.min(CHAT_SHOWN, ((await read($, threadsAtom))[chosen] ?? []).length)
+    const chosen = (await getSelected($)) || (await getChannels($))[0]?.id || ''
+    const length = Math.min(CHAT_SHOWN, ((await getThreads($))[chosen] ?? []).length)
     const isJump = e.pointer === undefined && Math.abs(e.by) >= Math.max(e.bodyRows, e.contentRows)
     if (isJump) {
-      await update($, skipAtom, () => (e.by < 0 ? Math.max(0, length - 1) : 0))
+      await setSkip($, (e.by < 0 ? Math.max(0, length - 1) : 0))
       return {}
     }
     const steps = Math.sign(e.by) * Math.max(1, Math.round(Math.abs(e.by) / 3))
-    await update($, skipAtom, skip => Math.max(0, Math.min(Math.max(0, length - 1), skip - steps)))
+    await updateSkip($, skip => Math.max(0, Math.min(Math.max(0, length - 1), skip - steps)))
 
     return {}
   })
@@ -2445,16 +2511,16 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const table = $.ui.resolve(e)
     const { Box, Text, Button, Markdown } = table
-    const rows = await read($, channelsAtom)
-    const threads = await read($, threadsAtom)
-    const info = await read($, infoAtom)
-    const declining = await read($, decliningAtom)
-    const expanded = await read($, expandedAtom)
-    const pages = await read($, pagesAtom)
-    const skipWanted = await read($, skipAtom)
-    const focus = await read($, focusAtom)
-    const reviewerMode = await read($, reviewerModeAtom)
-    const chosen = (await read($, selectedAtom)) || rows[0]?.id || ''
+    const rows = await getChannels($)
+    const threads = await getThreads($)
+    const info = await getInfo($)
+    const declining = await getDeclining($)
+    const expanded = await getExpanded($)
+    const pages = await getPages($)
+    const skipWanted = await getSkip($)
+    const focus = await getFocus($)
+    const reviewerMode = await getReviewerMode($)
+    const chosen = (await getSelected($)) || rows[0]?.id || ''
     const row = rows.find(r => r.id === chosen)
     const thread = threads[chosen] ?? []
     const recent = thread.slice(-CHAT_SHOWN)
@@ -2651,12 +2717,12 @@ export const register: Register = (on, options) => {
                               <Text dimColor>lines {view.first}–{view.last} of {view.lineCount} · Approve covers the whole message</Text>
                               {view.page > 0 && (
                                 <Button key={`page-up:${m.id}`} plain label="▲ earlier lines" onPress={() => {
-                                  void update($, pagesAtom, all => ({ ...all, [m.id]: Math.max(0, view.page - 1) }))
+                                  void updatePages($, all => ({ ...all, [m.id]: Math.max(0, view.page - 1) }))
                                 }} />
                               )}
                               {view.page < view.pageCount - 1 && (
                                 <Button key={`page-down:${m.id}`} plain label="▼ later lines" onPress={() => {
-                                  void update($, pagesAtom, all => ({ ...all, [m.id]: view.page + 1 }))
+                                  void updatePages($, all => ({ ...all, [m.id]: view.page + 1 }))
                                 }} />
                               )}
                             </Box>
@@ -2684,7 +2750,7 @@ export const register: Register = (on, options) => {
                             dimColor
                             label={isOpen ? '▲ Show less' : `▼ Show full message (${m.length.toLocaleString('en')} characters)`}
                             onPress={() => {
-                              void update($, expandedAtom, list =>
+                              void updateExpanded($, list =>
                                 list.includes(m.id) ? list.filter(x => x !== m.id) : [...list, m.id].slice(-50))
                             }}
                           />
@@ -2709,7 +2775,7 @@ export const register: Register = (on, options) => {
                         key={`cancel:${m.id}`}
                         label="Cancel"
                         onPress={() => {
-                          void update($, decliningAtom, () => '')
+                          void setDeclining($, '')
                         }}
                       />
                     </Box>
@@ -2739,7 +2805,7 @@ export const register: Register = (on, options) => {
                           key={`decline-open:${m.id}`}
                           label="Decline"
                           onPress={() => {
-                            void update($, decliningAtom, () => m.id)
+                            void setDeclining($, m.id)
                           }}
                         />
                       )}
@@ -2764,7 +2830,7 @@ export const register: Register = (on, options) => {
                 plain
                 label={`↓ ${skip} newer message${skip === 1 ? '' : 's'} · jump to latest`}
                 onPress={() => {
-                  void update($, skipAtom, () => 0)
+                  void setSkip($, 0)
                 }}
               />
             )}

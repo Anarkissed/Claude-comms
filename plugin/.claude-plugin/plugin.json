@@ -1,6 +1,6 @@
 {
   "name": "agent-comms",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Message channels between your Claude Code sessions (coding agents, a reviewer and you), kept as JSON files in a local folder; a reviewer's message reaches an agent only after you approve it. Works in the Claude desktop app's Code tab, the terminal and IDEs.",
   "author": {
     "name": "Anarkissed",

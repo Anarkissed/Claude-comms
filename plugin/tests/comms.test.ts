@@ -714,7 +714,7 @@ describe('6b. registering a new agent with /comms-as', () => {
     expect(cfg.channels).toEqual([...DEFAULT_CONFIG.channels, { id: '363', members: ['reviewer', '363'] }])
     expect(cfg.require_approval).toBe(true)
     expect(cfg.poll_seconds).toBe(15)
-    expect(w.keeps.has(`${msgDir('363')}/.keep`) && w.keeps.has(`${apprDir('363')}/.keep`)).toBe(true)
+    expect(w.keeps.size).toBe(0) // no placeholder files: the folder comes with its setup note
     const notes = [...w.files.entries()].filter(([p]) => p.startsWith(`${msgDir('363')}/`))
     expect(notes).toHaveLength(1)
     const note = parse(notes[0]?.[1] ?? '', nameOf(notes[0]?.[0] ?? '').slice(0, -5))
@@ -739,7 +739,7 @@ describe('6b. registering a new agent with /comms-as', () => {
     expect(known.text).not.toContain('Registered')
     expect(w.files.get(`${ROOT}/channels.json`)).toBe(before)
     expect(w.ran.some(a => a[0] === '/bin/mv' && a[3] === `${ROOT}/channels.json`)).toBe(false)
-    expect(w.keeps.has(`${msgDir('358')}/.keep`)).toBe(true)
+    expect(w.keeps.size).toBe(0)
   })
 
   test('before /comms-setup a new id is not registered and nothing is created', async ($, on) => {
@@ -1340,7 +1340,7 @@ describe('group chats (several agents and the reviewer)', () => {
     expect(made.text).toBe('Group #team is ready: reviewer, 354, 358. Messages to "all" reach everyone in it; each agent sees it beside its own channel.')
     const cfg = JSON.parse(w.files.get(`${ROOT}/channels.json`) ?? '{}')
     expect(cfg.channels).toEqual([...DEFAULT_CONFIG.channels, { id: 'team', members: ['reviewer', '354', '358'] }])
-    expect(w.keeps.has(`${msgDir('team')}/.keep`) && w.keeps.has(`${apprDir('team')}/.keep`)).toBe(true)
+    expect(w.keeps.size).toBe(0)
     const notes = groupFiles(w)
     expect(notes).toHaveLength(1)
     expect(notes[0]).toMatchObject({ from: 'maintainer', to: 'all', kind: 'note' })
@@ -2824,5 +2824,35 @@ describe('sixth review fixes (2026-10-14)', () => {
     await ui.input({ key: `decline:${m.id}`, text: 'no' })
     expect(filesIn(w, '358').some(n => n.to === '358' && n.body.includes('Nothing is coming'))).toBe(true)
     await ui.unmount()
+  })
+})
+
+describe('directory review fixes (2026-10-14)', () => {
+  test('a new agent whose channel folder cannot be made is told so, not that it was created', async ($, on) => {
+    const w = world(on, { writeFailsOnce: p => p.includes('/channels/363/messages/') })
+    await start($)
+    const joined = await $.command.run({ command: 'comms-as', args: '363', ...PERSON })
+    expect(joined.text).toContain('not joined: could not create the channel folders: channels/363/')
+    expect(joined.text).not.toContain('created channels/363/')
+  })
+
+  test('a group whose folder cannot be made is reported, not "ready"', async ($, on) => {
+    const w = world(on, { identity: 'maintainer', writeFailsOnce: p => p.includes('/channels/team/messages/') })
+    await start($)
+    const made = await $.command.run({ command: 'comms-group', args: 'team 354 358', ...PERSON })
+    expect(made.text).toContain("Could not create the group's folders: channels/team/")
+    expect(made.text).not.toContain('is ready')
+  })
+
+  test('the pane state reads and writes through plain $.state calls: a selected channel survives a remount', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    seedMessage(w, '354', { from: 'reviewer', to: '354', body: 'on 354', at: T0 - 1000, hex: 'd10001' })
+    await start($)
+    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    await ui.press({ key: 'ch:354' })
+    await ui.unmount()
+    const again = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    expect(await again.find({ type: 'Text', text: /on 354/ })).toBeDefined()
+    await again.unmount()
   })
 })
