@@ -280,7 +280,7 @@ def make_handler(folder: core.Folder, token: str, port_box: Dict[str, int], lan:
                     info = ""
                 else:
                     return self._json(404, {"ok": False, "error": "not found"})
-            except OSError as error:
+            except (OSError, ValueError) as error:
                 return self._json(500, {"ok": False, "error": str(error)})
             return self._json(200, {"ok": True, "info": info})
 

@@ -48,6 +48,8 @@ declare module 'claude-code' {
       reviewerMode: string
       /** The main loop's running turn id; empty when the session is idle. Kept in state so a reload mid-turn knows. */
       turn: string
+      /** Per waiting message, the page of its lines the pane shows. */
+      pages: Record<string, number>
     }
   }
 }

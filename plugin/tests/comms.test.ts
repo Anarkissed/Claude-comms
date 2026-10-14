@@ -46,6 +46,10 @@ type World = {
   store: Map<string, unknown>
   /** The transcript id $.session.id() answers; a test changes it to model /clear, /resume or a fork. */
   sid: string
+  /** The conversation's rows' texts ($.session.messages()); a test edits them to model a rewind. */
+  messages: string[]
+  /** The user-turn count ($.session.turns()). */
+  turns: number
 }
 
 const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/'
@@ -113,6 +117,8 @@ const world = (on: On, options: WorldOptions = {}): World => {
     keeps: undefined as unknown as Set<string>, // set just below
     store: new Map(), // filled just below
     sid: options.sid ?? SID,
+    messages: [...(options.messages ?? [])],
+    turns: 0,
   }
   let statusText: string | undefined
   w.keeps = keeps
@@ -238,7 +244,8 @@ const world = (on: On, options: WorldOptions = {}): World => {
     return { ...ok, exitCode: 127 }
   }
   on('session.id', () => ({ value: w.sid }))
-  on('session.messages', () => ({ value: (options.messages ?? []).map(text => ({ role: 'user', text, toolUses: [] })) }))
+  on('session.messages', () => ({ value: w.messages.map(text => ({ role: 'user', text, toolUses: [] })) }))
+  on('session.turns', () => ({ value: w.turns }))
   on('session.cwd', () => ({ value: options.windows ? 'C:\\work' : CWD }))
   on('prompt.submit', ($, e) => {
     w.prompts.push(e.text)
@@ -275,6 +282,7 @@ const world = (on: On, options: WorldOptions = {}): World => {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }
   })
   on('turn.complete', () => ({ text: '' }))
+  on('session.end', ($, e) => ({ sessionId: (e as { sessionId?: string }).sessionId ?? w.sid }))
   // the tools themselves, for calls the guard lets through
   on('tool.call', ($, e) => ({ result: `ran ${e.tool}` }))
 
@@ -1825,7 +1833,7 @@ describe('audit fixes (2026-10-14)', () => {
 
   test('Approve replaces a half-written approval file, and the phone code reports what really happened', async ($, on) => {
     const w = world(on, { identity: 'maintainer' })
-    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'half-approved', at: T0 - 1000, hex: 'aud011' })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'half-approved', at: T0 - 1000, hex: 'a0d011' })
     put(w, `${apprDir('358')}/${m.id}.json`, '{"id":"')
     await start($)
     const code = await $.command.run({ command: 'comms-approve', args: m.id.slice(-6), ...PERSON })
@@ -2004,5 +2012,287 @@ describe('audit fixes (2026-10-14)', () => {
   test('isReadOnlyCommand: reading programs pass; redirection, substitution, tee and writing find actions do not', () => {
     for (const ok of ['cat a', 'ls -la x | grep y', 'git log -- x', 'head -5 a && wc -l b', 'find . -name x', 'cat a 2>/dev/null']) expect(isReadOnlyCommand(ok)).toBe(true)
     for (const bad of ['echo x > a', 'cat a >> b', 'cat a | tee b', 'cat $(x)', 'cat `x`', 'find . -delete', 'rm a', 'cp a b', 'git commit -m x', 'sed -i s/a/b/ f']) expect(isReadOnlyCommand(bad)).toBe(false)
+  })
+})
+
+describe('second review fixes (2026-10-14)', () => {
+  const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
+    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+  const filesIn = (w: World, ch: string) =>
+    [...w.files.entries()]
+      .filter(([p]) => p.startsWith(`${msgDir(ch)}/`))
+      .map(([p, text]) => parse(text, nameOf(p).slice(0, -5)))
+      .flatMap(r => (r.ok ? [r.message] : []))
+  const DENIED = 'written only through'
+  const WITH_DIRECT = { ...DEFAULT_CONFIG, channels: [...DEFAULT_CONFIG.channels, { id: 'direct', members: ['reviewer', 'maintainer'] }] }
+  const FOLDER = ROOT.slice(ROOT.lastIndexOf('/') + 1)
+
+  // ---- the guard
+
+  test('isReadOnlyCommand closes the second review\'s holes', () => {
+    for (const bad of [
+      'cat a & rm -rf b', 'cat <(rm x)', 'echo (rm x)', 'sort -o out in', 'sort -uo f f', 'sort --output=f f', 'uniq in out', 'tree -o f',
+      'rg --pre ./x pattern', 'GIT_EXTERNAL_DIFF=./x git diff a b', 'git -c core.pager=x log', 'git diff --output=f', 'git grep --open-files-in-pager=x y',
+      'find . -fprint0 x', "find . '-delete'", 'find . -ex\\ec rm {} ;', 'cat a |& tee b', 'xxd in out', 'plutil -remove k f',
+    ]) expect(isReadOnlyCommand(bad)).toBe(false)
+    for (const ok of ['LC_ALL=C sort f', 'sort -r f', 'rg pattern dir', 'git status', 'cat a 2>&1 | head', 'find . -name "*.json" -print']) expect(isReadOnlyCommand(ok)).toBe(true)
+  })
+
+  test('the guard: shell case alias, /.vol, file://, filename keys and a directory key joined to a relative path', async ($, on) => {
+    world(on, { identity: '358' })
+    await start($)
+    expect(denial(await $.tool.call({ tool: 'Bash', command: `rm -rf ${ROOT.toUpperCase()}/channels` }))).toContain(DENIED)
+    expect(denial(await $.tool.call({ tool: 'Write', file_path: '/.vol/16777220/12345/x.json', content: '{}' }))).toContain(DENIED)
+    expect(denial(await $.tool.call({ tool: 'mcp__x__save', path: `file://${ROOT}/channels/358/approvals/x.json` }))).toContain(DENIED)
+    expect(denial(await $.tool.call({ tool: 'mcp__x__save', filename: `${ROOT}/channels/358/approvals/x.json` }))).toContain(DENIED)
+    expect(denial(await $.tool.call({ tool: 'mcp__x__download', out_dir: HOME, path: `${FOLDER}/channels/358/approvals/x.json` }))).toContain(DENIED)
+    // report-only tools write nothing
+    expect(denial(await $.tool.call({ tool: 'StructuredOutput', findings: [{ file: `${ROOT}/channels.json` }] }))).toBeUndefined()
+  })
+
+  test('on macOS and Linux a name like "x:held.json" is a relative file name, not a Windows drive', () => {
+    expect(absolutize('a:held.json', `${ROOT}/channels/358/held`, HOME, false)).toBe(`${ROOT}/channels/358/held/a:held.json`)
+    expect(absolutize('back\\slash.json', ROOT, HOME, false)).toBe(`${ROOT}/back\\slash.json`)
+    expect(absolutize(`\\\\localhost\\C$\\Users\\me\\${FOLDER}\\x`, 'C:/work', 'C:/Users/me', true)).toBe(`C:/Users/me/${FOLDER}/x`)
+  })
+
+  // ---- identity and the store
+
+  test('a refused identity write is reported as "not joined", never as a join that another session then "takes"', async ($, on) => {
+    const w = world(on, { storeRefuses: key => key.startsWith('identity:') })
+    await start($)
+    const r = await $.command.run({ command: 'comms-as', args: '358', ...PERSON })
+    expect(r.text).toContain('not joined: the plugin store refused')
+    expect(w.status() ?? '').not.toContain('taken by another session')
+  })
+
+  test('a long delivered record keeps its newest ids and a floor; a message delivered long ago is not sent again', async ($, on) => {
+    const old = Array.from({ length: 3000 }, (_, i) => `2026-09-01T00-00-00.000Z-maintainer-${i.toString(16).padStart(6, '0')}`)
+    const w = world(on, { identity: '358', store: { 'delivered:S1:358': old } })
+    // one of the old, already delivered messages is still in the folder (messages are never deleted)
+    const delivered = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'delivered in september', nowMs: Date.UTC(2026, 8, 1), hex: '000005' })
+    expect(delivered.id).toBe(old[5])
+    put(w, `${msgDir('358')}/${delivered.id}.json`, format(delivered))
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'new one', at: T0 - 1000, hex: 'a00002' })
+    await start($)
+    await turn($, 1)
+    expect(w.appended.some(t => t.includes('new one'))).toBe(true)
+    expect((w.store.get('delivered:S1:358') as string[]).length).toBe(2000)
+    expect((w.store.get('delivered:S1:358') as string[]).includes(old[5] ?? '')).toBe(false)
+    expect(typeof w.store.get('floor:S1:358')).toBe('string')
+    await turn($, 2)
+    expect(w.appended.some(t => t.includes('delivered in september'))).toBe(false)
+  })
+
+  test('terminal /resume while not joined takes the conversation\'s identity, with its tools', async ($, on) => {
+    const w = world(on, { store: { 'identity:S2': '361' } })
+    await start($)
+    expect(w.tools).toEqual([])
+    w.sid = 'S2'
+    await turn($, 1)
+    expect(w.tools).toContain('comms_post')
+    expect((await $.command.run({ command: 'comms-as', args: '', ...PERSON })).text).toContain('this session is 361')
+  })
+
+  test('terminal /clear after another session took the name: nothing is carried over and the session steps down', async ($, on) => {
+    const w = world(on, { identity: '358' })
+    await start($)
+    w.store.delete(`identity:${SID}`)
+    w.sid = 'S2'
+    await turn($, 1)
+    expect(w.store.has('identity:S2')).toBe(false)
+    expect(w.status()).toContain('was taken by another session')
+  })
+
+  test('terminal /clear stamps the new transcript\'s start, so its records last their 14 days', async ($, on) => {
+    const w = world(on, { identity: '358' })
+    await start($)
+    w.sid = 'S2'
+    await turn($, 1)
+    expect(typeof w.store.get('active:S2')).toBe('number')
+  })
+
+  test('no imported marker for an owner the old store does not know; the shared keys are marked once', async ($, on) => {
+    const w = world(on, { host: 'local_A' })
+    put(w, OLD_STORE, JSON.stringify({ 'identity:OTHER': '358', 'held:maintainer': [] }))
+    await start($)
+    expect(w.store.has('imported:local_A')).toBe(false)
+    expect(w.store.get('imported:shared')).toBe(true)
+  })
+
+  test('an agent that joined before setup is registered by the first poll that finds channels.json, wherever setup ran', async ($, on) => {
+    const w = world(on, { config: null })
+    await start($)
+    await $.command.run({ command: 'comms-as', args: '363', ...PERSON })
+    put(w, `${ROOT}/channels.json`, JSON.stringify(PUBLIC_DEFAULT))
+    await w.clock.advance(15_000)
+    const cfg = JSON.parse(w.files.get(`${ROOT}/channels.json`) ?? '{}') as { channels: { id: string }[] }
+    expect(cfg.channels.some(c => c.id === '363')).toBe(true)
+  })
+
+  test('an agent listed in another case (frontend) is not registered again as Frontend', async ($, on) => {
+    const w = world(on, { config: { ...DEFAULT_CONFIG, channels: [{ id: 'team', members: ['reviewer', 'frontend', 'backend'] }] } })
+    await start($)
+    expect((await $.command.run({ command: 'comms-as', args: 'Frontend', ...PERSON })).text).toContain('is not an id this session can take')
+    expect(JSON.parse(w.files.get(`${ROOT}/channels.json`) ?? '{}').channels).toHaveLength(1)
+  })
+
+  test('an agent whose own channel was made a group by hand still joins', async ($, on) => {
+    world(on, { config: { ...DEFAULT_CONFIG, channels: [{ id: '358', members: ['reviewer', '358', '359'] }] } })
+    await start($)
+    expect((await $.command.run({ command: 'comms-as', args: '358', ...PERSON })).text).toContain('this session is 358')
+  })
+
+  // ---- delivery and turns
+
+  test('Esc during the last step: no wake prompt, and none at the next poll until the person starts a turn', async ($, on) => {
+    const w = world(on, { identity: '358' })
+    await start($)
+    await $.turn.start({ text: 'working', turnId: 't1' })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'arrived mid-turn', at: T0 - 1000, hex: 'b00001' })
+    await w.clock.advance(15_000)
+    for await (const _ of $.turn.step({ turnId: 't1', index: 2, model: 'm', messageCount: 4 })) {
+      // drain
+    }
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't1', reason: 'aborted' })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'arrived after', at: T0 - 500, hex: 'b00002' })
+    await w.clock.advance(15_000)
+    expect(w.prompts).toEqual([])
+  })
+
+  test('a reviewer\'s message to the maintainer goes to #direct, not the first agent channel', async ($, on) => {
+    const w = world(on, { identity: 'reviewer', config: WITH_DIRECT })
+    await start($)
+    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'maintainer', kind: 'question', text: 'a word?' })
+    expect(denial(posted)).toBeUndefined()
+    expect(filesIn(w, 'direct').some(m => m.body === 'a word?')).toBe(true)
+    expect(filesIn(w, '358').some(m => m.body === 'a word?')).toBe(false)
+  })
+
+  test('an in-place rewind (same transcript, fewer turns) delivers the messages it cut out again', async ($, on) => {
+    const w = world(on, { identity: '358', messages: ['first prompt', 'first answer'] })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'will be rewound away', at: T0 - 1000, hex: 'b00003' })
+    w.turns = 1
+    await start($)
+    w.turns = 2
+    await turn($, 2)
+    expect(w.appended.filter(t => t.includes('will be rewound away'))).toHaveLength(1)
+    // the person rewinds to before turn 2 and types again: the row is gone, the turn count is back to 2
+    w.messages = ['first prompt', 'first answer']
+    await turn($, 3)
+    expect(w.appended.filter(t => t.includes('will be rewound away'))).toHaveLength(2)
+  })
+
+  test('after a desktop /clear the delivered list starts over: a later restart does not send pre-clear messages again', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'before the clear', nowMs: T0 - 1000, hex: 'b00004' })
+    const w = world(on, { host: 'local_A', store: { 'identity:local_A': '358', 'delivered:local_A:358': [m.id], 'recent:local_A': [{ ch: '358', id: m.id }] } })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    await start($)
+    await $.session.end({ reason: 'clear', sessionId: SID } as never)
+    expect(w.store.get('recent:local_A')).toEqual([])
+  })
+
+  // ---- the maintainer's actions
+
+  test('a hand-written id with no hex ending still gets a phone code that approves it', async ($, on) => {
+    const w = world(on, { identity: 'maintainer', surfaces: ['mobile'] })
+    const m = newMessage({ from: 'reviewer', to: '358', kind: 'ruling', body: 'hand written', nowMs: T0 - 1000, hex: 'ruling' })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    await start($)
+    const listing = await $.command.run({ command: 'comms', args: '', ...PERSON })
+    const code = /\/comms-approve ([0-9a-f]{6})/.exec(listing.text ?? '')?.[1] ?? ''
+    expect(code).toMatch(/^[0-9a-f]{6}$/)
+    expect((await $.command.run({ command: 'comms-approve', args: code, ...PERSON })).text).toContain('✓ Approved')
+  })
+
+  test('a hold whose notes were never sent is finished by the next Hold', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'retry', at: T0 - 1000, hex: 'b00005' })
+    put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T11:59:59.000Z","told":[]}\n`)
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `hold:${m.id}` }).catch(() => undefined)
+    expect(filesIn(w, '358').filter(n => n.body.startsWith('On hold'))).toHaveLength(2)
+    await ui.unmount()
+  })
+
+  test('Decline tells the agent "nothing is coming" only if it heard of the hold', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'never told', at: T0 - 1000, hex: 'b00006' })
+    put(w, `${ROOT}/channels/358/held/${m.id}.json`, `{"id":"${m.id}","by":"maintainer","ts":"2026-10-03T11:59:59.000Z","told":[]}\n`)
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: `decline-open:${m.id}` })
+    await ui.input({ key: `decline:${m.id}`, text: 'no' })
+    expect(filesIn(w, '358').some(n => n.from === 'maintainer' && n.to === '358')).toBe(false)
+    await ui.unmount()
+  })
+
+  test('a hold kept only in the store (from before holds were files) becomes a file', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'old hold', at: T0 - 1000, hex: 'b00007' })
+    w.store.set('held:maintainer', [m.id])
+    await start($)
+    expect(w.files.has(`${ROOT}/channels/358/held/${m.id}.json`)).toBe(true)
+  })
+
+  test('with no home folder, comms_post says so and writes nothing at the disk\'s root', async ($, on) => {
+    const w = world(on, { identity: '358', noHome: true, config: null })
+    put(w, '/channels.json', JSON.stringify(DEFAULT_CONFIG))
+    await start($)
+    const r = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'note', text: 'x' })
+    expect(denial(r)).toContain('no home folder')
+    expect([...w.files.keys()].some(p => p.startsWith('/channels/'))).toBe(false)
+  })
+
+  // ---- the pane
+
+  test('the character U+10EEEE never blanks the pane', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    seedMessage(w, '358', { from: '358', to: 'reviewer', kind: 'report', body: 'ok \u{10EEEE} done', at: T0 - 1000, hex: 'b00008' })
+    await start($)
+    const ui = await mount($)
+    expect((await ui.findAll({ type: 'Markdown' })).map(b => b.text)).toContain('ok  done')
+    await ui.unmount()
+  })
+
+  test('two channels holding the same message id each show their own text', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const a = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'in 358', nowMs: T0 - 1000, hex: 'b00009' })
+    const b = { ...a, to: '354', body: 'in 354' }
+    put(w, `${msgDir('358')}/${a.id}.json`, format(a))
+    put(w, `${msgDir('354')}/${a.id}.json`, format(b))
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: 'ch:358' })
+    expect((await ui.findAll({ type: 'Markdown' })).map(x => x.text)).toContain('in 358')
+    await ui.press({ key: 'ch:354' })
+    expect((await ui.findAll({ type: 'Markdown' })).map(x => x.text)).toContain('in 354')
+    await ui.unmount()
+  })
+
+  test('a waiting message shows its invisible characters before it is approved', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'looks fine\u200b\u{E0041}', at: T0 - 1000, hex: 'b0000a' })
+    await start($)
+    const ui = await mount($)
+    expect(await ui.find({ type: 'Text', text: /looks fine⟨U\+200B⟩⟨U\+E0041⟩/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /2 invisible characters/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a waiting message longer than the pane is read a page of lines at a time', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    const body = Array.from({ length: 120 }, (_, i) => `line ${i + 1}`).join('\n')
+    const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body, at: T0 - 1000, hex: 'b0000b' })
+    await start($)
+    const ui = await mount($, 'desktop', 40)
+    const first = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('\n')
+    expect(first).toContain('line 1\n')
+    expect(first).not.toContain('line 120')
+    expect(await ui.find({ type: 'Text', text: /lines 1–24 of 120/ })).toBeDefined()
+    await ui.press({ key: `page-down:${m.id}` })
+    expect(await ui.find({ type: 'Text', text: /lines 25–48 of 120/ })).toBeDefined()
+    await ui.unmount()
   })
 })

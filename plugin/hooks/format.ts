@@ -358,7 +358,7 @@ export const setupNoteBody = (channel: Channel, requireApproval: boolean): strin
   [
     `${setupNoteMarker} ${isGroup(channel) ? 'Group' : 'Channel'} #${channel.id}: members ${channel.members.join(', ')}.`,
     ...(isGroup(channel)
-      ? ['In this group, "to": "all" reaches every member but the sender; "to": "<id>" reaches that member only. The maintainer and the reviewer see the whole thread.']
+      ? ['In this group, "to": "all" reaches every member but the sender; "to": "<id>" reaches that member only. The maintainer sees the whole thread; the reviewer, like every member, receives what is addressed to it or to "all".']
       : []),
     'Each message is one JSON file in channels/<channel>/messages/, named <UTC ISO timestamp with ":" replaced by "-">-<from>-<6 hex>.json, holding',
     '{"v": 1, "id": "<file name without .json>", "from": "<id>", "to": "<id>", "kind": "<kind>", "ts": "<UTC ISO>", "body": "<text>"}.',

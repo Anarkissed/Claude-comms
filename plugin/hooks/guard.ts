@@ -23,6 +23,9 @@ export const EXEMPT_TOOLS = new Set([
   'SendMessage',
   // a workflow's script orchestrates agents; each agent's own tool calls are checked one by one
   'Workflow',
+  // report-only: a subagent's result and a code review's findings write nothing
+  'StructuredOutput',
+  'ReportFindings',
 ])
 
 /** Input keys holding a path the tool will touch. */
@@ -49,7 +52,10 @@ export const PATH_KEYS = new Set([
  * dir, directory, file, folder, dest, destination, target or output (out_dir,
  * output_path, saveFile…), so a tool with its own key names is checked too.
  */
-export const PATH_KEY_PATTERN = /(path|paths|dir|directory|file|folder|dest|destination|target|output)$/i
+export const PATH_KEY_PATTERN = /(path|paths|dir|directory|file|files|filename|file_name|folder|dest|destination|target|output|out|outfile|location|save_to|saveto)$/i
+
+/** Keys naming a directory another key's relative path is joined to (out_dir + path). */
+export const DIR_KEY_PATTERN = /(dir|directory|folder|cwd|root)$/i
 
 /** Whether `key` holds a path to check: one of PATH_KEYS or a key matching PATH_KEY_PATTERN. */
 export const isPathKey = (key: string): boolean => PATH_KEYS.has(key) || PATH_KEY_PATTERN.test(key)
@@ -86,24 +92,37 @@ const isAbsolutePath = (path: string): boolean => path.startsWith('/') || /^[A-Z
  * `~`, `$HOME`, `%USERPROFILE%` and `$env:USERPROFILE` expanded, made absolute
  * under `cwd`, `.` and `..` folded; a Windows path keeps its drive (`C:/…`).
  */
-export const absolutize = (path: string, cwd: string, home: string): string => {
+export const absolutize = (path: string, cwd: string, home: string, onWindows = /^[A-Za-z]:\//.test(toSlashes(home))): string => {
   const h = toSlashes(home)
-  let p = toSlashes(path.trim())
-  // Windows' long-path forms: \\?\C:\x and \\?\UNC\server\share are C:/x and //server/share
-  p = p.replace(/^\/\/[?.]\/UNC\//i, '//').replace(/^\/\/[?.]\/(?=[A-Za-z]:)/, '')
+  // a file:// address names the same path
+  let p = path.trim().replace(/^file:\/\/(localhost)?(?=\/)/i, '')
+  try {
+    if (/%[0-9A-Fa-f]{2}/.test(p) && path.trim().toLowerCase().startsWith('file:')) p = decodeURIComponent(p)
+  } catch {
+    // a malformed escape: keep it as written
+  }
+  // backslashes are separators only on Windows; elsewhere they are ordinary characters in a name
+  if (onWindows) p = toSlashes(p)
+  if (onWindows) {
+    // Windows' long-path forms: \\?\C:\x and \\?\UNC\server\share are C:/x and //server/share;
+    // the loopback admin share \\localhost\C$\x is C:/x
+    p = p.replace(/^\/\/[?.]\/UNC\//i, '//').replace(/^\/\/[?.]\/(?=[A-Za-z]:)/, '')
+    p = p.replace(/^\/\/(localhost|127\.0\.0\.1|\.)\/([A-Za-z])\$(?=\/|$)/i, '$2:')
+  }
   if (p === '~' || p.startsWith('~/')) p = h + p.slice(1)
   p = p.replace(/^(\$\{?HOME\}?|%USERPROFILE%|\$env:USERPROFILE)(?=\/|$)/i, h)
-  // a drive-relative path (C:x) is relative to that drive's current folder: the session's, when on the same drive
-  const driveRelative = /^([A-Za-z]:)(?!\/)(.*)$/.exec(p)
+  // Windows only: a drive-relative path (C:x) is relative to that drive's current folder (the session's, on the same drive)
+  const driveRelative = onWindows ? /^([A-Za-z]:)(?!\/)(.*)$/.exec(p) : null
   if (driveRelative) {
     const c = toSlashes(cwd)
     const sameDrive = c.slice(0, 2).toUpperCase() === (driveRelative[1] ?? '').toUpperCase()
     p = `${sameDrive ? c.replace(/\/+$/, '') : `${driveRelative[1]}`}/${driveRelative[2] ?? ''}`
   }
-  if (!isAbsolutePath(p)) p = `${toSlashes(cwd).replace(/\/+$/, '')}/${p}`
-  // a network path keeps its two leading slashes
-  let drive = /^\/\/[^/]/.test(p) ? '/' : ''
-  const withDrive = /^([A-Za-z]:)(\/.*)?$/.exec(p)
+  const absolute = onWindows ? isAbsolutePath(p) : p.startsWith('/')
+  if (!absolute) p = `${toSlashes(cwd).replace(/\/+$/, '')}/${p}`
+  // a network path keeps its two leading slashes (Windows)
+  let drive = onWindows && /^\/\/[^/]/.test(p) ? '/' : ''
+  const withDrive = onWindows ? /^([A-Za-z]:)(\/.*)?$/.exec(p) : null
   if (withDrive) {
     drive = (withDrive[1] ?? '').toUpperCase()
     p = withDrive[2] ?? '/'
@@ -124,35 +143,61 @@ export const absolutize = (path: string, cwd: string, home: string): string => {
  * denying), and with macOS's `/System/Volumes/Data` spelling of the same path folded.
  */
 export const isInside = (path: string, root: string): boolean => {
-  const fold = (s: string) => toSlashes(s).replace(/^\/System\/Volumes\/Data(?=\/)/i, '').toLowerCase()
+  const fold = (s: string) => toSlashes(s).normalize('NFC').replace(/^\/System\/Volumes\/Data(?=\/)/i, '').toLowerCase()
   const p = fold(path)
   const r = fold(root)
   return p === r || p.startsWith(r.endsWith('/') ? r : `${r}/`)
 }
 
-/** Programs that only read: a shell command made only of these, with no redirection, never writes. */
+/**
+ * Programs that only read whatever their arguments: a shell command made only
+ * of these, with no redirection, never writes. (Programs that can write a file
+ * through an argument, such as uniq IN OUT, tree -o, xxd IN OUT or plutil, are
+ * left out; sort, rg and git are checked option by option below.)
+ */
 const READ_ONLY_PROGRAMS = new Set([
-  'cat', 'head', 'tail', 'less', 'more', 'ls', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'stat', 'file', 'jq',
-  'diff', 'cmp', 'du', 'tree', 'readlink', 'realpath', 'basename', 'dirname', 'sort', 'uniq', 'cut', 'nl',
-  'echo', 'printf', 'test', '[', 'true', 'pwd', 'shasum', 'md5', 'md5sum', 'sha256sum', 'plutil', 'xxd', 'od', 'hexdump',
+  'cat', 'head', 'tail', 'less', 'more', 'ls', 'grep', 'egrep', 'fgrep', 'wc', 'stat', 'file', 'jq',
+  'diff', 'cmp', 'du', 'readlink', 'realpath', 'basename', 'dirname', 'cut', 'nl',
+  'echo', 'printf', 'test', '[', 'true', 'pwd', 'shasum', 'md5', 'md5sum', 'sha256sum', 'od', 'hexdump',
 ])
-/** git subcommands that only read. */
+/** git subcommands that only read (their options are checked too). */
 const READ_ONLY_GIT = new Set(['log', 'show', 'status', 'diff', 'blame', 'grep', 'ls-files', 'rev-parse', 'branch', 'remote'])
+/** Environment variables a read may set in front of it: none of them makes a program run another. */
+const HARMLESS_ENV = /^(LC_[A-Z_]+|LANG|LANGUAGE|NO_COLOR|TERM|COLUMNS|LINES|TZ)=/
+/** find (and bfs, Claude Code's find) actions that write, delete or run a program, as whole words. */
+const FIND_WRITES = /^-(delete|rm|exec|execdir|ok|okdir|fprint0?|fprintf|fls)$/
 
 /**
- * Whether a shell command only reads: every part (split on ; && || |) runs a
- * read-only program, with no output redirection, no command substitution and
- * no find action that writes. Best effort, like the rest of the shell check.
+ * Whether a shell command only reads: every part (split on ; & && || | |& and
+ * newlines) runs a read-only program with options that write nothing or run
+ * nothing else, and the command holds no output redirection, no tee, no
+ * parenthesis (command or process substitution, a subshell, PowerShell's
+ * (...) and @(...)) and no backquote. Best effort, like the rest of the shell check.
  */
 export const isReadOnlyCommand = (command: string): boolean => {
-  if (/[`]|\$\(|>(?!\s*&?\s*(1|2|\/dev\/null)\b)|\btee\b/.test(command)) return false
-  const parts = command.split(/;|&&|\|\||\||\n/).map(part => part.trim()).filter(Boolean)
+  if (/[`()]|>(?!\s*&?\s*(1|2|\/dev\/null)\b)|\btee\b/.test(command)) return false
+  const parts = command.split(/;|&&|\|\||\|&?|(?<![<>])&(?!>)|\r|\n/).map(part => part.trim()).filter(Boolean)
   if (parts.length === 0) return false
   return parts.every(part => {
-    const words = part.replace(/^(\w+=\S*\s+)+/, '').split(/\s+/)
+    const raw = part.split(/\s+/)
+    let at = 0
+    while (at < raw.length && /^\w+=/.test(raw[at] ?? '')) {
+      if (!HARMLESS_ENV.test(raw[at] ?? '')) return false
+      at += 1
+    }
+    // quotes and backslashes are what the shell takes away before the program sees a word
+    const words = raw.slice(at).map(w => w.replace(/['"\\]/g, ''))
     const program = (words[0] ?? '').replace(/^.*\//, '')
-    if (program === 'git') return READ_ONLY_GIT.has(words.find((w, i) => i > 0 && !w.startsWith('-')) ?? '')
-    if (program === 'find') return !/\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/.test(part)
+    const args = words.slice(1)
+    if (program === 'git') {
+      // global options before the subcommand (-c, -C, --exec-path, --git-dir…) can change what runs
+      const sub = args[0] ?? ''
+      if (!READ_ONLY_GIT.has(sub)) return false
+      return !args.some(w => /^--(output|ext-diff|open-files-in-pager|textconv)(=|$)|^-O/.test(w))
+    }
+    if (program === 'find') return !args.some(w => FIND_WRITES.test(w))
+    if (program === 'sort') return !args.some(w => /^-[^-]*o/.test(w) || /^--output(=|$)/.test(w))
+    if (program === 'rg') return !args.some(w => /^--pre(-glob)?(=|$)/.test(w))
     return READ_ONLY_PROGRAMS.has(program)
   })
 }
@@ -194,12 +239,12 @@ export const rootSpellings = (roots: readonly string[], home: string): string[] 
  * mentioned the name (a commit message, a README heading).
  */
 export const commandMentionsRoot = (command: string, spellings: readonly string[], base: string): boolean => {
-  // Windows paths are not case-sensitive: compare the command and the spellings without case there
+  // macOS and Windows file systems ignore case (as isInside does): compare without case everywhere
   const lower = command.toLowerCase()
-  if (spellings.some(s => command.includes(s) || (/^[A-Za-z]:|%USERPROFILE%|\$env:/i.test(s) && lower.includes(s.toLowerCase())))) return true
+  if (spellings.some(s => lower.includes(s.toLowerCase()))) return true
   const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-  return new RegExp(`(^|[\\s;&|(<>'"=])(\\.[/\\\\])?${escaped}[/\\\\]`).test(command)
+  return new RegExp(`(^|[\\s;&|(<>'"=])(\\.[/\\\\])?${escaped}[/\\\\]`, 'i').test(command)
 }
 
 export const denyText = (root: string): string =>

@@ -28,13 +28,16 @@ def is_id(value: Any) -> bool:
 
 
 def is_ts(value: Any) -> bool:
+    """The plugin's check: the pattern, then the field ranges its runtime's Date.parse checks. Date.parse
+    does not check the calendar (Feb 30 rolls over to Mar 2, year 0000 is fine) and takes 24:00:00 as the
+    next midnight, so a stricter check here would hide messages the plugin shows and delivers."""
     if not isinstance(value, str) or not TS_RE.match(value):
         return False
-    try:  # a real date, as the plugin's Date.parse check
-        datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
-        return True
-    except ValueError:
+    month, day = int(value[5:7]), int(value[8:10])
+    hour, minute, second = int(value[11:13]), int(value[14:16]), int(value[17:19])
+    if not (1 <= month <= 12 and 1 <= day <= 31 and minute <= 59 and second <= 59):
         return False
+    return hour <= 23 or (hour == 24 and minute == 0 and second == 0 and not re.search(r"\.[0-9]*[1-9]", value))
 
 
 def is_reviewer(i: str) -> bool:
@@ -102,9 +105,14 @@ def new_message(sender: str, to: str, kind: str, body: str) -> Dict[str, Any]:
     return {"v": 1, "id": stem, "from": sender, "to": to, "kind": kind, "ts": ts, "body": body}
 
 
+def well_formed(text: str) -> str:
+    """Any surrogate left in a Python str is a lone one (json.loads joins real pairs): made U+FFFD, as the plugin's wellFormed()."""
+    return re.sub("[\ud800-\udfff]", "\ufffd", text)
+
+
 def dumps(value: Any) -> str:
-    """JSON as the mod's JSON.stringify writes it: compact, UTF-8 kept."""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    """JSON as the mod's JSON.stringify writes it: compact, UTF-8 kept, never half an emoji."""
+    return well_formed(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
 def format_message(m: Dict[str, Any]) -> str:
@@ -277,10 +285,48 @@ class Folder:
                 unreadable.add(name[:-5])
         return out
 
-    def held_ids(self, ch: str) -> Set[str]:
-        """Messages on hold: channels/<ch>/held/<id>.json, written by this desk or the plugin's pane."""
+    def held_records(self, ch: str) -> Dict[str, Optional[List[str]]]:
+        """Messages on hold: channels/<ch>/held/<id>.json, written by this desk or the plugin's pane, each with
+        who was told so far ("told"); None when the record does not say (an older one: everyone)."""
         d = self.channel_dir(ch, "held")
-        return {name[:-5] for name in (os.listdir(d) if os.path.isdir(d) else []) if is_candidate(name)}
+        out: Dict[str, Optional[List[str]]] = {}
+        for name in os.listdir(d) if os.path.isdir(d) else []:
+            if not is_candidate(name):
+                continue
+            told: Optional[List[str]] = None
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as handle:
+                    value = json.loads(handle.read())
+                if isinstance(value, dict) and isinstance(value.get("told"), list):
+                    told = [t for t in value["told"] if isinstance(t, str)]
+            except (OSError, ValueError, UnicodeDecodeError):
+                told = None
+            out[name[:-5]] = told
+        return out
+
+    def held_ids(self, ch: str) -> Set[str]:
+        return set(self.held_records(ch))
+
+    def _write_held(self, ch: str, mid: str, ts: str, told: List[str], replace: bool) -> None:
+        write_atomic(self.channel_dir(ch, "held"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": ts, "told": told}) + "\n", replace=replace)
+
+    def migrate_legacy_held(self, cfg: Dict[str, Any]) -> None:
+        """Holds kept only in this desk's state.json (before holds were files): written as files once, so the plugin sees them."""
+        state = self.state()
+        legacy = list(state.get("held", []))
+        if not legacy:
+            return
+        for channel in cfg["channels"]:
+            messages, _, _, approved, declined = self.scan(channel)
+            records = self.held_records(channel["id"])
+            for m in messages:
+                if m["id"] in legacy and m["id"] not in records and is_awaiting_approval(m, approved, set(declined), cfg["require_approval"]):
+                    try:
+                        self._write_held(channel["id"], m["id"], iso_now(), [ALL] if m["to"] == ALL else [m["from"], m["to"]], replace=False)
+                    except FileExistsError:
+                        pass
+        state["held"] = []
+        self.save_state(state)
 
     def scan(self, channel: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int, bool, Set[str], Dict[str, str]]:
         d = self.channel_dir(channel["id"], "messages")
@@ -307,6 +353,7 @@ class Folder:
         cfg = self.config()
         if cfg is None:
             return {"ok": False, "error": "channels.json is missing or unreadable: run /comms-setup in Claude Code first."}
+        self.migrate_legacy_held(cfg)
         state = self.state()
         seen = state.get("seen", {})
         legacy_held = set(state.get("held", []))
@@ -394,23 +441,37 @@ class Folder:
         return f"✓ Approved {m['from']}'s {m['kind']} to {m['to']}; it reaches {m['to']} at its next step."
 
     def hold(self, ch: str, mid: str) -> str:
+        """The hold is a file the plugin's pane reads too: its first writer tells the others, the second tells no
+        one twice. The file records who was told, so a note that failed is sent at the next Hold."""
         m, why = self._find_waiting(ch, mid)
         if m is None:
             return f"Not held: {why}"
         agent_side = "the group" if m["to"] == ALL else m["to"]
-        # the hold is a file the plugin's pane reads too: its first writer tells the others, the second tells no one twice
-        if mid in set(self.state().get("held", [])):
-            return f"Already on hold; {m['from']} and {agent_side} were told."
-        try:
-            write_atomic(self.channel_dir(ch, "held"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": iso_now()}) + "\n")
-        except FileExistsError:
-            return f"Already on hold; {m['from']} and {agent_side} were told."
-        if m["to"] == ALL:
-            # the group is told something waits, never what it says (the text is not approved); "all" reaches the reviewer too
-            self._note(ch, ALL, f"On hold: {with_article(m['kind'])} from {m['from']} to the group is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.")
+        recipients = [ALL] if m["to"] == ALL else [m["from"], m["to"]]
+        ts = iso_now()
+        records = self.held_records(ch)
+        if mid in records or mid in set(self.state().get("held", [])):
+            told = records.get(mid) or (recipients if records.get(mid) is None else [])
         else:
-            self._note(ch, m["from"], f"On hold: your {m['kind']} to {m['to']} (\"{first_line(m['body'])}\") is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.")
-            self._note(ch, m["to"], f"On hold: {with_article(m['kind'])} from {m['from']} to you is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon.")
+            try:
+                self._write_held(ch, mid, ts, [], replace=False)
+            except FileExistsError:
+                return "Already on hold."
+            told = []
+        missing = [r for r in recipients if r not in told]
+        if not missing:
+            return f"Already on hold; {m['from']} and {agent_side} were told."
+        for r in missing:
+            if r == ALL:
+                # the group is told something waits, never what it says (the text is not approved); "all" reaches the reviewer too
+                body = f"On hold: {with_article(m['kind'])} from {m['from']} to the group is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon."
+            elif r == m["from"]:
+                body = f"On hold: your {m['kind']} to {m['to']} (\"{first_line(m['body'])}\") is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon."
+            else:
+                body = f"On hold: {with_article(m['kind'])} from {m['from']} to you is on hold with the maintainer and has not been delivered yet. Expect a message from the maintainer soon."
+            self._note(ch, r, body)
+            told = told + [r]
+            self._write_held(ch, mid, ts, told, replace=True)
         return f"⏸ On hold: {m['from']} and {agent_side} were told to expect a message soon."
 
     def decline(self, ch: str, mid: str, reason: str) -> str:
@@ -425,7 +486,13 @@ class Folder:
             write_atomic(self.channel_dir(ch, "declined"), mid + ".json", dumps({"id": mid, "by": MAINTAINER, "ts": iso_now(), "reason": reason}) + "\n", replace=replace)
         except FileExistsError:
             return "Already declined elsewhere a moment ago."
-        was_held = mid in self.held_ids(ch) or mid in set(self.state().get("held", []))
+        records = self.held_records(ch)
+        agent_recipient = ALL if m["to"] == ALL else m["to"]
+        if mid in records:
+            # "nothing is coming" only to a side that was told of the hold
+            was_held = records[mid] is None or agent_recipient in (records[mid] or [])
+        else:
+            was_held = mid in set(self.state().get("held", []))
         line = f"Reason: {reason or '(no reason given)'}"
         to_whom = f"the group #{ch}" if m["to"] == ALL else m["to"]
         agent_side = "the group" if m["to"] == ALL else m["to"]
@@ -488,7 +555,7 @@ class Folder:
         if not any(m["from"] == MAINTAINER and m["body"].startswith(SETUP_MARKER) for m in messages):
             body = (
                 f"{SETUP_MARKER} Group #{name}: members {', '.join(group['members'])}.\n"
-                'In this group, "to": "all" reaches every member but the sender; "to": "<id>" reaches that member only. The maintainer and the reviewer see the whole thread.\n'
+                'In this group, "to": "all" reaches every member but the sender; "to": "<id>" reaches that member only. The maintainer sees the whole thread; the reviewer, like every member, receives what is addressed to it or to "all".\n'
                 "A message from any reviewer reaches the agents only after the maintainer approves it. Agents post with comms_post and read with comms_read."
             )
             m = new_message(MAINTAINER, ALL, "note", body)

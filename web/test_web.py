@@ -326,8 +326,11 @@ class GroupTests(World):
         self.folder.decline("team", waiting["id"], "Not yet.")
         declines = [m for m in self.messages("team") if m["from"] == "maintainer" and m["body"].startswith("Declined")]
         # it was on hold, so the group was promised word: it is told only that nothing is coming
-        self.assertEqual([n["to"] for n in declines], ["reviewer", "all"])
-        self.assertNotIn("Not yet", declines[1]["body"])
+        # (notes written in the same millisecond sort by their random hex, so compare without order)
+        self.assertEqual(sorted(n["to"] for n in declines), ["all", "reviewer"])
+        to_group = next(n for n in declines if n["to"] == "all")
+        self.assertNotIn("Not yet", to_group["body"])
+        self.assertIn("Not yet", next(n for n in declines if n["to"] == "reviewer")["body"])
 
     def test_create_group_over_http(self):
         token = "k"
@@ -456,7 +459,41 @@ class AuditFixTests(World):
         self.assertFalse(core.is_ts("2026-10-08T12:00:00.000Z\n"))
         self.assertFalse(core.is_ts("2026-13-45T12:00:00.000Z"))
         self.assertFalse(core.is_ts("２０２６-10-08T12:00:00.000Z"))
+        self.assertFalse(core.is_ts("2026-10-08T25:00:00.000Z"))
         self.assertTrue(core.is_ts("2026-10-08T12:00:00.000Z"))
+        # the plugin's Date.parse rolls these over and accepts them, so the desk must too
+        for rolled in ("2026-02-30T12:00:00Z", "2026-09-31T12:00:00.000Z", "2026-10-03T24:00:00Z", "0000-01-01T00:00:00Z"):
+            self.assertTrue(core.is_ts(rolled), rolled)
+
+    def test_a_hold_whose_note_failed_is_finished_by_the_next_hold(self):
+        m = self.seed("358", "reviewer", "358", "retry me", hexid="aud008")
+        core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": "2026-10-08T12:00:01.000Z", "told": ["reviewer"]}) + "\n")
+        self.folder.hold("358", m["id"])
+        to_agent = [n for n in self.messages("358") if n["from"] == "maintainer" and n["to"] == "358" and n["body"].startswith("On hold")]
+        self.assertEqual(len(to_agent), 1)
+        self.assertTrue(self.folder.hold("358", m["id"]).startswith("Already on hold"))
+
+    def test_decline_says_nothing_is_coming_only_to_a_side_that_heard_of_the_hold(self):
+        m = self.seed("358", "reviewer", "358", "never told", hexid="aud009")
+        core.write_atomic(self.folder.channel_dir("358", "held"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "maintainer", "ts": "2026-10-08T12:00:01.000Z", "told": []}) + "\n")
+        self.folder.decline("358", m["id"], "no")
+        self.assertFalse(any(n["to"] == "358" for n in self.messages("358") if n["from"] == "maintainer"))
+
+    def test_a_desk_hold_from_before_the_upgrade_becomes_a_file(self):
+        m = self.seed("358", "reviewer", "358", "old hold", hexid="aud010")
+        self.folder.save_state({"held": [m["id"]]})
+        self.folder.snapshot()
+        self.assertIn(m["id"], self.folder.held_ids("358"))
+        self.assertEqual(self.folder.state().get("held"), [])
+
+    def test_hold_and_decline_quote_half_an_emoji_safely(self):
+        d = self.folder.channel_dir("358", "messages")
+        os.makedirs(d, exist_ok=True)
+        stem = "2026-10-08T12-00-00.000Z-reviewer-aud011"
+        with open(os.path.join(d, stem + ".json"), "w") as h:
+            h.write('{"v":1,"id":"%s","from":"reviewer","to":"358","kind":"ruling","ts":"2026-10-08T12:00:00.000Z","body":"cut \\ud83d"}\n' % stem)
+        self.assertTrue(self.folder.hold("358", stem).startswith("⏸ On hold"))
+        self.assertIn("Declined", self.folder.decline("358", stem, "no"))
 
     def test_reserved_names_in_any_case_are_not_groups_or_agents(self):
         self.assertFalse(core.is_group_id("ALL"))
