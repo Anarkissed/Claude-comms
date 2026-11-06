@@ -2856,3 +2856,159 @@ describe('directory review fixes (2026-10-14)', () => {
     await again.unmount()
   })
 })
+
+describe('deleting a thread (2026-11-06)', () => {
+  const mount = ($: Engine) =>
+    $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+  const tabs = async (ui: { findAll: (q: { type: string }) => Promise<{ key?: string; text: string }[]> }) =>
+    (await ui.findAll({ type: 'Button' })).map(b => b.text).filter(t => t.startsWith('#'))
+  const channelIds = (w: World) => (JSON.parse(w.files.get(`${ROOT}/channels.json`) ?? '{}') as { channels: { id: string }[] }).channels.map(c => c.id)
+
+  test('Delete thread asks first; Delete removes the channel everywhere, marks it and forgets its records', async ($, on) => {
+    const w = world(on, {
+      identity: 'maintainer',
+      store: { 'delivered:S1:358': ['x'], 'floor:S1:358': 'x', 'seen:maintainer:358': ['x'], 'delivered:S1:354': ['y'] },
+    })
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'old work', at: T0 - 1000, hex: 'de0001' })
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: 'ch:358' })
+    await ui.press({ key: 'delete-open:358' })
+    expect(await ui.find({ type: 'Text', text: /Delete #358 and its 1 message \(1 still waiting for approval, never delivered\)\?/ })).toBeDefined()
+    expect(channelIds(w)).toContain('358') // nothing happens before the second press
+    await ui.press({ key: 'delete:358' })
+    expect(channelIds(w)).not.toContain('358')
+    expect(channelIds(w)).toContain('354')
+    const mark = JSON.parse(w.files.get(`${ROOT}/channels/358/deleted.json`) ?? '{}') as { id?: string; by?: string; ts?: string; files?: string[] }
+    expect(mark).toMatchObject({ id: '358', by: 'maintainer' })
+    expect(mark.files).toHaveLength(1) // the one message the thread held
+    expect(Number.isFinite(Date.parse(mark.ts ?? ''))).toBe(true)
+    expect(w.store.has('delivered:S1:358') || w.store.has('floor:S1:358') || w.store.has('seen:maintainer:358')).toBe(false)
+    expect(w.store.get('delivered:S1:354')).toEqual(['y'])
+    expect((await tabs(ui)).some(t => t.includes('358'))).toBe(false)
+    expect(await ui.find({ type: 'Text', text: /Deleted #358/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('Cancel closes the question and changes nothing; switching channels closes it too', async ($, on) => {
+    const w = world(on, { identity: 'maintainer' })
+    await start($)
+    const before = w.files.get(`${ROOT}/channels.json`)
+    const ui = await mount($)
+    await ui.press({ key: 'ch:358' })
+    await ui.press({ key: 'delete-open:358' })
+    await ui.press({ key: 'delete-cancel:358' })
+    expect(await ui.find({ type: 'Text', text: /Delete #358 and its/ })).toBeUndefined()
+    await ui.press({ key: 'delete-open:358' })
+    await ui.press({ key: 'ch:354' })
+    expect(await ui.find({ type: 'Text', text: /Delete #358 and its/ })).toBeUndefined()
+    expect(w.files.get(`${ROOT}/channels.json`)).toBe(before)
+    expect(w.files.has(`${ROOT}/channels/358/deleted.json`)).toBe(false)
+    await ui.unmount()
+  })
+
+  test('#direct (you and the reviewer) has no Delete thread button', async ($, on) => {
+    world(on, { identity: 'maintainer', config: { ...DEFAULT_CONFIG, channels: [...DEFAULT_CONFIG.channels, { id: 'direct', members: ['reviewer', 'maintainer'] }] } })
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: 'ch:direct' })
+    expect((await ui.findAll({ type: 'Button' })).some(b => b.key === 'delete-open:direct')).toBe(false)
+    await ui.press({ key: 'ch:358' })
+    expect((await ui.findAll({ type: 'Button' })).some(b => b.key === 'delete-open:358')).toBe(true)
+    await ui.unmount()
+  })
+
+  test('a channel made again under a deleted name starts empty: nothing from before is delivered, a new setup note is', async ($, on) => {
+    const w = world(on, { config: { ...DEFAULT_CONFIG, channels: DEFAULT_CONFIG.channels.filter(c => c.id !== '358') } })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'from the old thread', at: T0 - 5000, hex: 'de0002' })
+    const old = [...w.files.keys()].filter(p => p.startsWith(`${msgDir('358')}/`)).map(nameOf)
+    put(w, `${ROOT}/channels/358/deleted.json`, `${JSON.stringify({ id: '358', by: 'maintainer', ts: new Date(T0 - 2000).toISOString(), files: old })}\n`)
+    await start($)
+    const joined = await $.command.run({ command: 'comms-as', args: '358', ...PERSON })
+    expect(joined.text).toContain('Registered 358')
+    await turn($, 1)
+    expect(w.appended.some(t => t.includes('from the old thread'))).toBe(false)
+    expect(w.appended.some(t => t.includes('[agent-comms setup]'))).toBe(true)
+  })
+
+  test('an agent whose thread was deleted gets nothing more from it', async ($, on) => {
+    const w = world(on, { identity: '358', config: { ...DEFAULT_CONFIG, channels: DEFAULT_CONFIG.channels.filter(c => c.id !== '358') } })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'after the delete', at: T0 - 500, hex: 'de0003' })
+    await start($)
+    await turn($, 1)
+    expect(w.appended.some(t => t.includes('after the delete'))).toBe(false)
+    const read = await $.tool.call({ tool: 'mcp__agent-comms__comms_read' })
+    expect(denial(read) ?? String(read.result)).not.toContain('after the delete')
+  })
+})
+
+describe('deleting a thread: review fixes (2026-11-06)', () => {
+  const mount = ($: Engine) =>
+    $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+  const without358 = { ...DEFAULT_CONFIG, channels: DEFAULT_CONFIG.channels.filter(c => c.id !== '358') }
+  const markOf = (w: World) => `${ROOT}/channels/358/deleted.json`
+  const deletedWith = (w: World, files: string[]) =>
+    put(w, markOf(w), `${JSON.stringify({ id: '358', by: 'maintainer', ts: new Date(T0 - 2000).toISOString(), files })}\n`)
+
+  test('the mark hides exactly the files the thread held: a broken one is not counted, a future-dated one stays hidden', async ($, on) => {
+    const w = world(on, { identity: 'maintainer', config: without358 })
+    const future = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'stamped an hour ahead', at: T0 + 3_600_000, hex: 'de1001' })
+    put(w, `${apprDir('358')}/${future.id}.json`, formatApproval({ id: future.id, by: 'maintainer', ts: '2026-10-03T12:00:02.000Z' }))
+    put(w, `${msgDir('358')}/2026-10-01T00-00-00.000Z-354-de1002.json`, '{"not": "a message"}')
+    deletedWith(w, [`${future.id}.json`, '2026-10-01T00-00-00.000Z-354-de1002.json'])
+    await start($)
+    // made again (as an agent's /comms-as 358 would: channels.json lists it once more)
+    put(w, `${ROOT}/channels.json`, JSON.stringify(DEFAULT_CONFIG))
+    await w.clock.advance(15_000)
+    const ui = await mount($)
+    await ui.press({ key: 'ch:358' })
+    expect(await ui.find({ type: 'Text', text: /unreadable file/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /stamped an hour ahead/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('while the mark cannot be read, nothing of the old thread reaches the agent', async ($, on) => {
+    const old = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'OLD WORK', nowMs: T0 - 5000, hex: 'de1003' })
+    const w = world(on, { identity: '358', readFailsOnce: [`${ROOT}/channels/358/deleted.json`] })
+    put(w, `${msgDir('358')}/${old.id}.json`, format(old))
+    deletedWith(w, [`${old.id}.json`])
+    await start($)
+    await turn($, 1)
+    await turn($, 2)
+    expect(w.appended.some(t => t.includes('OLD WORK'))).toBe(false)
+    expect(w.prompts.some(t => t.includes('new agent-comms message'))).toBe(false)
+  })
+
+  test('when channels.json cannot be changed, Delete says so and the thread stays as it was', async ($, on) => {
+    const w = world(on, { identity: 'maintainer', writeFailsOnce: p => p.endsWith('/channels.json') })
+    seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'still waiting', at: T0 - 1000, hex: 'de1004' })
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: 'ch:358' })
+    await ui.press({ key: 'delete-open:358' })
+    await ui.press({ key: 'delete:358' })
+    expect(await ui.find({ type: 'Text', text: /Not deleted/ })).toBeDefined()
+    const mark = JSON.parse(w.files.get(`${ROOT}/channels/358/deleted.json`) ?? '{}') as { files?: string[] }
+    expect(mark.files).toEqual([]) // put back: it hides nothing
+    await w.clock.advance(15_000)
+    expect(await ui.find({ type: 'Text', text: /still waiting/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('#Direct (any case) has no Delete; a channel whose folder another shares is refused', async ($, on) => {
+    const w = world(on, {
+      identity: 'maintainer',
+      config: { ...DEFAULT_CONFIG, channels: [...DEFAULT_CONFIG.channels, { id: 'Direct', members: ['reviewer', '358', '354'] }, { id: 'Team', members: ['reviewer', '358', '354'] }, { id: 'team', members: ['reviewer', '361', '362'] }] },
+    })
+    await start($)
+    const ui = await mount($)
+    await ui.press({ key: 'ch:Direct' })
+    expect((await ui.findAll({ type: 'Button' })).some(b => b.key === 'delete-open:Direct')).toBe(false)
+    await ui.press({ key: 'ch:Team' })
+    await ui.press({ key: 'delete-open:Team' })
+    await ui.press({ key: 'delete:Team' })
+    expect(await ui.find({ type: 'Text', text: /Not deleted: #Team shares its folder with #team/ })).toBeDefined()
+    expect(w.files.has(`${ROOT}/channels/Team/deleted.json`)).toBe(false)
+    await ui.unmount()
+  })
+})

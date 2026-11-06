@@ -12,6 +12,7 @@ On macOS you can double-click `Agent Comms.command` or `Agent Comms (phone).comm
 - **Folder:** `AGENT_COMMS_ROOT`, default `~/agent-comms`.
 - **Desk state:** what you've seen and held is kept in `~/.claude/agent-comms-web/state.json` (`AGENT_COMMS_WEB_STATE` to change). Use either this desk or the `/comms` pane for Hold, or a message may be announced twice.
 - **Phone mode safety:** only home-network addresses (10.x, 172.16–31.x, 192.168.x) are served. Pairing takes the 6-character code (or the QR), five wrong codes lock it, and the code changes after each pairing. The key and the code live only in memory. It's plain HTTP, so use it on a home network you trust.
+- **Delete thread:** in a conversation's header (not `#direct`). After you confirm, the channel leaves `channels.json` and its folder (every message and record) is removed. Threads deleted in the plugin's pane keep their files (its file API can't delete); the sidebar lists them with **Remove files**.
 - **After an update:** if the page and the server don't match, the page asks you to restart the server.
 
 Tests: `python3 -m unittest -v test_web`.

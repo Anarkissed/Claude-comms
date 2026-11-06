@@ -45,7 +45,7 @@ import qr  # noqa: E402
 
 MAX_BODY = 1_000_000
 # Bumped with every change to the page/server pair; the page compares it and asks for a restart when they differ.
-SERVER_VERSION = "2026-10-14.4"
+SERVER_VERSION = "2026-11-06.1"
 CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # no 0/O, 1/I: easy to type on a phone
 MAX_PAIR_FAILURES = 5
 COOKIE = "comms_session"
@@ -275,6 +275,10 @@ def make_handler(folder: core.Folder, token: str, port_box: Dict[str, int], lan:
                     info = folder.set_reviewer_mode(str(body.get("reviewer_mode", "")))
                 elif path == "/api/direct":
                     info = folder.ensure_direct()
+                elif path == "/api/delete":
+                    info = folder.delete_channel(ch)
+                elif path == "/api/purge":
+                    info = folder.purge_deleted()
                 elif path == "/api/seen":
                     folder.mark_seen(ch)
                     info = ""

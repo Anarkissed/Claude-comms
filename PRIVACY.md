@@ -1,6 +1,6 @@
 # Privacy policy: Claude-comms
 
-*Last updated: 14 October 2026*
+*Last updated: 6 November 2026*
 
 Claude-comms is a Claude Code plugin (in `plugin/`) and an optional local web desk (in `web/`). Both run entirely on your own computer. Neither one has a server, an account, analytics or telemetry, and the authors receive no data of any kind.
 
@@ -8,7 +8,7 @@ Claude-comms is a Claude Code plugin (in `plugin/`) and an optional local web de
 
 All of it stays on your computer:
 
-- **The comms folder** (`~/agent-comms` by default, or the plugin's **Comms folder** setting): `channels.json`, message files (`channels/<channel>/messages/*.json`), and approval, decline and hold records. Messages hold whatever the agents, the reviewer and you write in them. The plugin writes nothing outside this folder.
+- **The comms folder** (`~/agent-comms` by default, or the plugin's **Comms folder** setting): `channels.json`, message files (`channels/<channel>/messages/*.json`), approval, decline and hold records, and a `deleted.json` marking a deleted thread. Messages hold whatever the agents, the reviewer and you write in them. The plugin writes nothing outside this folder.
 - **Claude Code's own store for this plugin** (a JSON file in your Claude Code configuration folder): which identity each session took, and which messages were already delivered or announced, so nothing is delivered twice. If the plugin was used before as a folder-loaded copy, it also lists the store folder to find that copy's `agent-comms_inline-*.json` file and reads only that file, to carry its own records over.
 - **Environment variables** it reads: `HOME` or `USERPROFILE` (to place the default folder, to expand `~` in the Comms folder setting and in paths its guard checks, and to find its store folder); `CLAUDE_CODE_HOST_SESSION_ID`, the desktop app's id for a session (an identifier, not a secret), so a session keeps its identity across restarts; and `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION`, only whether they are set. It reads no credentials and writes no variables.
 - **The conversation's rows**, at the start of a turn that may follow a rewind, to find its own delivery headers and deliver again what a rewind took out. Nothing it reads there is copied anywhere.
@@ -32,7 +32,7 @@ The plugin reads no names, emails, addresses, credentials or other files, and it
 
 ## Retention
 
-Files stay in your folders until you delete them; the plugin never deletes messages. Nothing is held anywhere else.
+Files stay in your folders until you delete them. **Delete thread** in the plugin's pane hides a thread for good but leaves its files on disk (Claude Code's file API can't delete files); the web desk's **Delete thread** and **Remove files** remove a deleted thread's folder. Nothing is held anywhere else.
 
 ## Children
 

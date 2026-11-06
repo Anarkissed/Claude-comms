@@ -62,6 +62,8 @@ type Engine = EngineInterface
 
 const PLUGIN = 'agent-comms'
 const PANE = 'comms'
+/** The maintainer and the reviewer alone: never deleted. */
+const DIRECT_CHANNEL = 'direct'
 const READ_TOOL = 'comms_read'
 const POST_TOOL = 'comms_post'
 const READ_FULL = `mcp__${PLUGIN}__${READ_TOOL}`
@@ -97,6 +99,13 @@ async function getInfo($: Engine): Promise<string> {
 }
 async function setInfo($: Engine, value: string): Promise<void> {
   await $.state.set({ plugin: 'agent-comms', key: 'info' }, value)
+}
+async function getDeleting($: Engine): Promise<string> {
+  const { value = '' } = await $.state.get({ plugin: 'agent-comms', key: 'deleting' })
+  return value
+}
+async function setDeleting($: Engine, value: string): Promise<void> {
+  await $.state.set({ plugin: 'agent-comms', key: 'deleting' }, value)
 }
 async function getDeclining($: Engine): Promise<string> {
   const { value = '' } = await $.state.get({ plugin: 'agent-comms', key: 'declining' })
@@ -276,6 +285,8 @@ const paths = {
   declined: (ch: string) => `${root}/channels/${ch}/declined`,
   /** One file per message on hold, shared by the pane and the web desk. */
   held: (ch: string) => `${root}/channels/${ch}/held`,
+  /** The channel's own folder; `deleted.json` in it marks a deleted thread. */
+  channel: (ch: string) => `${root}/channels/${ch}`,
 }
 
 /**
@@ -866,15 +877,51 @@ const scanChannel = async ($: Engine, channel: Channel): Promise<ChannelScan> =>
     held.set(stem, told)
   }
 
+  // a thread deleted earlier (deleted.json): the files it held are gone, readable or not, so a channel made
+  // again under the name starts empty; while the mark can't be read, nothing is shown or delivered
+  const hidden = await readHidden($, channel.id)
   const messages: Message[] = []
   let skipped = 0
-  for (const held of cache.values()) {
+  for (const [name, held] of cache) {
+    if (hidden === 'unknown' || hidden.has(name)) continue
     if (held.message) messages.push(held.message)
     else skipped += 1
   }
   messages.sort((a, b) => (a.ts === b.ts ? a.id.localeCompare(b.id) : a.ts.localeCompare(b.ts)))
 
   return { channel, messages, skipped, missing: listed.missing, approved, declined, held, unreadableRecords }
+}
+
+/** The last deletion mark read for each channel: it stands in while a read of the file fails. */
+const hiddenBefore = new Map<string, Set<string>>()
+
+/**
+ * The message files a deleted thread on `ch` held (`deleted.json`'s "files"): an empty set when it was
+ * never deleted, 'unknown' while the mark is there but can't be read (busy, half written) and none was
+ * read before, so nothing of the old thread is shown or delivered meanwhile.
+ */
+const readHidden = async ($: Engine, ch: string): Promise<Set<string> | 'unknown'> => {
+  const path = `${paths.channel(ch)}/deleted.json`
+  const exists = await $.fs.exists(path).catch(() => undefined)
+  if (exists === false) {
+    hiddenBefore.delete(ch)
+    return new Set()
+  }
+  const text = exists === undefined ? undefined : await $.fs.read(path).catch(() => undefined)
+  const names = typeof text === 'string' ? hiddenFiles(text) : undefined
+  if (names === undefined) return hiddenBefore.get(ch) ?? 'unknown'
+  hiddenBefore.set(ch, names)
+  return names
+}
+
+/** A deletion mark's "files", or undefined when the text is not one (half written, or not this record). */
+const hiddenFiles = (text: string): Set<string> | undefined => {
+  try {
+    const value = JSON.parse(text) as { files?: unknown }
+    return Array.isArray(value.files) ? new Set(value.files.filter((f): f is string => typeof f === 'string')) : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -1837,6 +1884,77 @@ const declineOnce = async ($: Engine, ch: string, id: string, reason: string) =>
   await scan($)
 }
 
+/**
+ * Delete a thread: the channel leaves channels.json (gone from every pane, the
+ * web desk and the agents' tools), its `deleted.json` hides everything it held
+ * (a channel made again under that name starts empty), and the store forgets
+ * what was delivered and seen on it. Claude Code's file API cannot delete
+ * files, so the messages stay on disk until the web desk removes them.
+ * #direct (you and the reviewer alone) stays.
+ */
+const deleteThread = async ($: Engine, ch: string) => {
+  if (me !== MAINTAINER) {
+    await notMaintainer($)
+    return
+  }
+  await once(`delete:${ch}`, () => deleteThreadOnce($, ch))
+}
+
+const deleteThreadOnce = async ($: Engine, ch: string) => {
+  await setDeleting($, '')
+  if (ch.toLowerCase() === DIRECT_CHANNEL) {
+    await setInfo($, '#direct is your private chat with the reviewer; it stays.')
+    return
+  }
+  // folders ignore case on macOS and Windows: a channel whose folder another channel shares is left alone
+  const twin = ((await loadConfig($)) ?? config)?.channels.find(c => c.id !== ch && c.id.toLowerCase() === ch.toLowerCase())
+  if (twin !== undefined) {
+    await setInfo($, `Not deleted: #${ch} shares its folder with #${twin.id}.`)
+    return
+  }
+  const markPath = `${paths.channel(ch)}/deleted.json`
+  const before = await $.fs.read(markPath).catch(() => undefined)
+  const hiddenEarlier = typeof before === 'string' ? hiddenFiles(before) ?? new Set<string>() : new Set<string>()
+  const listed = await listSafe($, paths.messages(ch))
+  const held = listed.entries.filter(e => e.kind === 'file' && isCandidateFile(e.name)).map(e => e.name)
+  const ts = new Date(await $.clock.now()).toISOString()
+  const mark = `${JSON.stringify({ id: ch, by: MAINTAINER, ts, files: [...new Set([...hiddenEarlier, ...held])].sort() })}\n`
+  // marked first: should channels.json not change, the mark is put back as it was
+  const marked = await writeAtomic($, paths.channel(ch), 'deleted.json', mark, true)
+  if (!marked.ok) {
+    await setInfo($, `Not deleted: ${marked.reason}`)
+    return
+  }
+  const result = await changeConfig($, raw => {
+    const channels = Array.isArray(raw.channels) ? raw.channels : []
+    const kept = channels.filter(c => !(typeof c === 'object' && c !== null && (c as { id?: unknown }).id === ch))
+    return kept.length === channels.length ? { done: true } : { write: { ...raw, channels: kept } }
+  })
+  if (!result.ok) {
+    const undone = typeof before === 'string' ? before : `${JSON.stringify({ id: ch, by: MAINTAINER, ts, files: [] })}\n`
+    await writeAtomic($, paths.channel(ch), 'deleted.json', undone, true)
+    hiddenBefore.delete(ch)
+    await setInfo($, `Not deleted: ${result.reason}`)
+    return
+  }
+  // what every session delivered and what you saw on it
+  await quietly($, async () => {
+    for (const key of await $.store.keys()) {
+      const isChannels = /^(delivered|floor):[^:]+:(.*)$/.exec(key)?.[2] === ch || key === seenKey(ch)
+      if (isChannels) await $.store.delete(key)
+    }
+  })
+  for (const cache of [files, approvals]) cache.delete(ch)
+  if ((await getSelected($)) === ch) {
+    // the pane falls back to the first channel, drawn at its latest message
+    await setSelected($, '')
+    await setSkip($, 0)
+    await setFocus($, '')
+  }
+  await setInfo($, `Deleted #${ch}: it is gone from every pane and from the agents. Its files stay on disk, hidden; the web desk's "Remove files" deletes them.`)
+  await scan($)
+}
+
 const postAsMaintainer = async ($: Engine, ch: string, to: string, value: string) => {
   if (me !== MAINTAINER) {
     await notMaintainer($)
@@ -2209,6 +2327,7 @@ const openChannel = async ($: Engine, ch: string, thread: readonly CommsThreadIt
   const target = recent.findIndex(m => m.fresh) >= 0 ? recent.findIndex(m => m.fresh) : recent.findIndex(m => m.pending)
   await setSelected($, ch)
   await setInfo($, '')
+  await setDeleting($, '')
   await setFocus($, (target >= 0 ? recent[target]?.id ?? '' : ''))
   await setSkip($, (target >= 0 ? recent.length - 1 - target : 0))
   await markSeen($, ch)
@@ -2515,6 +2634,7 @@ export const register: Register = (on, options) => {
     const threads = await getThreads($)
     const info = await getInfo($)
     const declining = await getDeclining($)
+    const deleting = await getDeleting($)
     const expanded = await getExpanded($)
     const pages = await getPages($)
     const skipWanted = await getSkip($)
@@ -2640,9 +2760,46 @@ export const register: Register = (on, options) => {
         {row !== undefined && (
           <Box flexDirection="row" justifyContent="space-between" marginTop={1}>
             <Text bold>💬 {row.agents.length > 0 ? row.agents.join(' + ') : `#${row.id} (you)`} ↔ reviewer</Text>
-            {row.skipped > 0 && (
-              <Text color="yellow">⚠ {row.skipped} unreadable file{row.skipped === 1 ? '' : 's'}</Text>
-            )}
+            <Box flexDirection="row" columnGap={1}>
+              {row.skipped > 0 && (
+                <Text color="yellow">⚠ {row.skipped} unreadable file{row.skipped === 1 ? '' : 's'}</Text>
+              )}
+              {row.id.toLowerCase() !== DIRECT_CHANNEL && deleting !== row.id && (
+                <Button
+                  key={`delete-open:${row.id}`}
+                  label="Delete thread"
+                  dimColor
+                  onPress={() => {
+                    void setDeleting($, row.id)
+                  }}
+                />
+              )}
+            </Box>
+          </Box>
+        )}
+        {row !== undefined && deleting === row.id && (
+          <Box key={`delete-confirm:${row.id}`} flexDirection="column" marginTop={1}>
+            <Text color="red">
+              Delete #{row.id} and its {row.total} message{row.total === 1 ? '' : 's'}
+              {row.pending > 0 ? ` (${row.pending} still waiting for approval, never delivered)` : ''}? It goes from every pane and from
+              {row.agents.length > 0 ? ` ${row.agents.join(', ')}` : ' the agents'}. A channel made again under this name starts empty.
+            </Text>
+            <Box flexDirection="row" columnGap={1}>
+              <Button
+                key={`delete:${row.id}`}
+                label={`Delete #${row.id}`}
+                onPress={() => {
+                  void deleteThread($, row.id)
+                }}
+              />
+              <Button
+                key={`delete-cancel:${row.id}`}
+                label="Cancel"
+                onPress={() => {
+                  void setDeleting($, '')
+                }}
+              />
+            </Box>
           </Box>
         )}
         <Text dimColor>{'─'.repeat(Math.max(10, Math.min(200, e.props.bodyColumns - 2)))}</Text>

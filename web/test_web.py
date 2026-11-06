@@ -202,6 +202,10 @@ class ServerTests(World):
         self.assertIn("Sent", json.loads(self.post("/api/post", {"channel": "361", "to": "361", "kind": "note", "text": "hi"})[1])["info"])
         self.assertEqual(self.post("/api/seen", {"channel": "358"})[0], 200)
 
+    def test_delete_and_remove_files_over_http(self):
+        self.assertIn("Deleted #361", json.loads(self.post("/api/delete", {"channel": "361"})[1])["info"])
+        self.assertIn("No files", json.loads(self.post("/api/purge", {})[1])["info"])
+
 
 
 class HomeNetworkTests(World):
@@ -653,6 +657,129 @@ class FourthReviewTests(World):
         core.write_atomic(self.folder.channel_dir("358", "declined"), m["id"] + ".json", core.dumps({"id": m["id"], "by": "reviewer", "ts": "x"}) + "\n")
         self.assertTrue(self.folder.hold("358", m["id"]).startswith("⏸ On hold"))
         self.assertEqual(len(self.on_hold()), 2)
+
+
+class DeleteThreadTests(World):
+    """Deleting a thread (2026-11-06): gone from both desks and the agents; the web desk removes its files."""
+
+    def channel_ids(self):
+        with open(os.path.join(self.root, "channels.json")) as h:
+            return [c["id"] for c in json.load(h)["channels"]]
+
+    def mark(self, ch, files):
+        """What the pane's Delete thread leaves: channels/<ch>/deleted.json listing the files it hides."""
+        core.write_atomic(self.folder.channel_folder(ch), "deleted.json", core.dumps({"id": ch, "by": "maintainer", "ts": "2026-10-09T00:00:00.000Z", "files": files}) + "\n", replace=True)
+
+    def set_channels(self, ids):
+        self.folder._update_config(lambda raw: raw.__setitem__("channels", [{"id": i, "members": ["reviewer", i]} for i in ids]))
+
+    def test_the_mark_hides_exactly_its_files_readable_or_not(self):
+        future = self.seed("358", "reviewer", "358", "stamped ahead", hexid="de1001", ts="2030-01-01T00:00:00.000Z")
+        broken = os.path.join(self.folder.channel_dir("358", "messages"), "2026-10-01T00-00-00.000Z-354-de1002.json")
+        with open(broken, "w") as h:
+            h.write("{not json")
+        self.mark("358", [future["id"] + ".json", os.path.basename(broken)])
+        new = self.seed("358", "reviewer", "358", "after the delete", hexid="de1003", ts="2026-10-10T00:00:00.000Z")
+        snap = self.folder.snapshot()
+        self.assertEqual([m["id"] for m in snap["threads"]["358"]], [new["id"]])
+        self.assertEqual(next(c for c in snap["channels"] if c["id"] == "358")["skipped"], 0)
+
+    def test_while_the_mark_cannot_be_read_nothing_of_the_thread_shows(self):
+        self.seed("358", "reviewer", "358", "old", hexid="de1004")
+        os.makedirs(os.path.join(self.folder.channel_folder("358"), "deleted.json"))  # there, but not readable as a file
+        self.assertEqual(self.folder.snapshot()["threads"]["358"], [])
+
+    def test_a_failed_config_change_puts_the_mark_back_and_keeps_the_thread(self):
+        m = self.seed("358", "reviewer", "358", "still waiting", hexid="de1005")
+        self.folder._update_config = lambda change: "channels.json kept changing under this write; try again."
+        self.assertIn("Not deleted", self.folder.delete_channel("358"))
+        self.assertFalse(os.path.exists(os.path.join(self.folder.channel_folder("358"), "deleted.json")))
+        self.assertEqual([x["id"] for x in self.folder.snapshot()["threads"]["358"]], [m["id"]])
+
+    def test_case_twins_are_never_removed_or_deleted(self):
+        # #Team deleted in the pane, then #team made again: one folder on macOS and Windows
+        self.seed("Team", "maintainer", "Team", "old team", kind="note", hexid="de1006")
+        self.mark("Team", [])
+        self.set_channels(["358", "team"])
+        self.assertEqual(self.folder.deleted_on_disk(self.folder.config()), [])
+        self.assertIn("No files", self.folder.purge_deleted())
+        self.assertTrue(os.path.isdir(self.folder.channel_folder("Team")))
+        # two listed channels sharing one folder: neither is deleted
+        self.set_channels(["358", "Team", "team"])
+        self.assertIn("shares its folder", self.folder.delete_channel("Team"))
+        self.assertIn("Team", self.channel_ids())
+
+    def test_direct_in_any_case_stays(self):
+        self.set_channels(["358", "Direct"])
+        self.assertIn("stays", self.folder.delete_channel("Direct"))
+        self.assertIn("Direct", self.channel_ids())
+
+    def test_remove_files_skips_links_and_counts_what_it_removed(self):
+        outside = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "deleted.json"), "w") as h:
+            h.write("{}")
+        os.makedirs(os.path.join(self.root, "channels"), exist_ok=True)
+        os.symlink(outside, self.folder.channel_folder("gone"))
+        self.assertEqual(self.folder.deleted_on_disk(self.folder.config()), [])
+        self.assertIn("No files", self.folder.purge_deleted())
+        self.assertTrue(os.path.exists(os.path.join(outside, "deleted.json")))
+
+    def test_delete_removes_the_channel_and_its_files(self):
+        self.seed("358", "reviewer", "358", "old work", hexid="de0001")
+        self.folder.save_state({"seen": {"358": ["x"], "354": ["y"]}})
+        info = self.folder.delete_channel("358")
+        self.assertTrue(info.startswith("🗑 Deleted #358"), info)
+        self.assertNotIn("358", self.channel_ids())
+        self.assertIn("354", self.channel_ids())
+        self.assertFalse(os.path.exists(self.folder.channel_folder("358")))
+        self.assertEqual(self.folder.state()["seen"], {"354": ["y"]})
+        self.assertNotIn("358", self.folder.snapshot()["threads"])
+
+    def test_direct_and_unknown_channels_are_not_deleted(self):
+        self.folder.ensure_direct()
+        self.assertIn("stays", self.folder.delete_channel("direct"))
+        self.assertIn("direct", self.channel_ids())
+        self.assertIn("not in channels.json", self.folder.delete_channel("nope"))
+
+    def test_a_thread_deleted_in_the_pane_is_hidden_and_its_files_can_be_removed(self):
+        old = self.seed("358", "maintainer", "358", "from the old thread", kind="note", hexid="de0002", ts="2026-10-08T12:00:00.000Z")
+        # the pane deleted it: the mark, and channels.json without 358; the files are still there
+        self.mark("358", [old["id"] + ".json"])
+        self.folder._update_config(lambda raw: raw.__setitem__("channels", [c for c in raw["channels"] if c["id"] != "358"]))
+        self.assertEqual(self.folder.snapshot()["deleted_on_disk"], ["358"])
+        # made again (an agent registered 358 anew): it starts empty
+        self.folder._update_config(lambda raw: raw.__setitem__("channels", raw["channels"] + [{"id": "358", "members": ["reviewer", "358"]}]))
+        snap = self.folder.snapshot()
+        self.assertEqual([m["id"] for m in snap["threads"]["358"]], [])
+        self.assertEqual(snap["deleted_on_disk"], [])
+        new = self.seed("358", "reviewer", "358", "after it was made again", hexid="de0003", ts="2026-10-10T00:00:00.000Z")
+        self.assertEqual([m["id"] for m in self.folder.snapshot()["threads"]["358"]], [new["id"]])
+        # a channel in channels.json is never purged, even with a mark
+        self.assertIn("No files", self.folder.purge_deleted())
+        self.assertTrue(os.path.exists(os.path.join(self.folder.channel_dir("358", "messages"), old["id"] + ".json")))
+
+    def test_remove_files_takes_only_deleted_threads_folders(self):
+        self.seed("361", "maintainer", "361", "kept", kind="note", hexid="de0004")
+        self.seed("999", "maintainer", "999", "deleted in the pane", kind="note", hexid="de0005")
+        self.mark("999", [])
+        os.makedirs(self.folder.channel_dir("stray", "messages"))  # not marked deleted: left alone
+        self.assertIn("Removed the files of 1 deleted thread", self.folder.purge_deleted())
+        self.assertFalse(os.path.exists(self.folder.channel_folder("999")))
+        self.assertTrue(os.path.exists(self.folder.channel_folder("361")))
+        self.assertTrue(os.path.exists(self.folder.channel_folder("stray")))
+
+    def test_a_link_in_place_of_a_channel_folder_is_never_followed(self):
+        outside = os.path.join(self.tmp.name, "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "keep.txt"), "w") as h:
+            h.write("x")
+        os.makedirs(os.path.join(self.root, "channels"), exist_ok=True)
+        os.symlink(outside, self.folder.channel_folder("362"))
+        self.assertIn("left alone", self.folder.delete_channel("362"))
+        self.assertTrue(os.path.exists(os.path.join(outside, "keep.txt")))
+        self.assertFalse(os.path.exists(os.path.join(outside, "deleted.json")))
+        self.assertIn("362", self.channel_ids())
 
 
 class NoHardLinkTests(World):

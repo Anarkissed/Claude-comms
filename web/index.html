@@ -127,6 +127,10 @@
   .chip { border: 1px solid var(--line); background: var(--field); color: var(--ink); border-radius: 999px; padding: 4px 12px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
   .chip.go { background: var(--ok); border-color: var(--ok); color: #fff; }
   .chip.no { color: var(--bad); }
+  .delthread { border: 0; background: none; color: var(--dim); font: inherit; font-size: 12.5px; cursor: pointer; padding: 0; margin-left: 8px; }
+  .delbox { margin: 8px 0 0; padding: 10px 12px; border: 1px solid var(--bad); border-radius: 12px; font-size: 13px; line-height: 1.4; }
+  .delbox .chip { margin: 8px 8px 0 0; }
+  .leftover { font-size: 12.5px; margin-top: 6px; }
   .declinebox { display: flex; gap: 6px; margin: 6px 4px 0; width: min(520px, 100%); }
   .declinebox textarea { flex: 1; }
 
@@ -192,9 +196,9 @@
   const token = new URLSearchParams(location.search).get('t') || ''
   const $ = id => document.getElementById(id)
   const PREVIEW = 1500
-  const PAGE_VERSION = '2026-10-14.4' // the server this page was written with; a different one asks for a restart
+  const PAGE_VERSION = '2026-11-06.1' // the server this page was written with; a different one asks for a restart
   const GROUP_MS = 5 * 60 * 1000, STAMP_MS = 60 * 60 * 1000
-  let data = null, lastJson = '', chosen = '', focusId = '', declining = '', dividerBefore = ''
+  let data = null, lastJson = '', chosen = '', focusId = '', declining = '', deleting = '', dividerBefore = ''
   const expanded = new Set()
 
   // the Mac's page carries the key in its link; a paired phone carries it as a cookie instead
@@ -283,7 +287,8 @@
     $('summary').textContent = [pending ? `${pending} to approve` : '', unread ? `${unread} unread` : ''].filter(Boolean).join(' · ') || 'All caught up'
     const mode = data.reviewer_mode || 'code'
     $('reviewer').innerHTML = `Reviewer is a <span class="seg"><button data-mode="code" class="${mode === 'code' ? 'on' : ''}" title="A Claude Code session runs /comms-as reviewer and is woken by every message sent to it">Code session</button><button data-mode="chat" class="${mode === 'chat' ? 'on' : ''}" title="A Chat agent reads the folder on its own schedule">Chat agent</button></span>` +
-      (data.has_direct === false ? ' <button class="mkdirect" data-direct="1">+ Private chat with the reviewer</button>' : '')
+      (data.has_direct === false ? ' <button class="mkdirect" data-direct="1">+ Private chat with the reviewer</button>' : '') +
+      ((data.deleted_on_disk || []).length ? `<div class="leftover">🗑 Files of deleted threads are still on disk: ${data.deleted_on_disk.map(id => '#' + esc(id)).join(', ')} <button class="mkdirect" data-purge="1">Remove files</button></div>` : '')
     $('stale').textContent = data.server_version === PAGE_VERSION ? '' :
       'Agent Comms was updated. Close its Terminal window and double-click the launcher again to finish (a phone pairs again after that).'
     const ph = data.phone
@@ -326,7 +331,11 @@
     const people = [...ch.agents, ...ch.reviewers]
     const who = (data.reviewer_mode || 'code') === 'chat' ? 'reviewer: Chat agent, reads on its schedule' : 'reviewer: Code session, woken by messages'
     const sub = ch.skipped ? `<div class="sub bad">⚠ ${ch.skipped} unreadable file${ch.skipped === 1 ? '' : 's'}</div>` : `<div class="sub">#${esc(ch.id)} · ${ch.pending ? ch.pending + ' waiting for approval · ' : ''}${who}</div>`
-    $('head').innerHTML = `<div class="avatars">${people.map(p => avatar(p, true)).join('')}</div><div class="title">${esc(ch.group ? '#' + ch.id + ' · ' + people.join(', ') : people.join(' & '))}</div>${sub}<div class="toast" id="toast"></div>`
+    const count = thread.filter(m => !m.setup).length
+    const delButton = ch.id.toLowerCase() === 'direct' || deleting === ch.id ? '' : `<button class="delthread" data-delete-open="${esc(ch.id)}" title="Remove this thread and its files">Delete thread</button>`
+    const delBox = deleting !== ch.id ? '' : `<div class="delbox">Delete #${esc(ch.id)} and its ${count} message${count === 1 ? '' : 's'}${ch.pending ? ` (${ch.pending} still waiting for approval, never delivered)` : ''}? It goes from both desks and from ${ch.agents.length ? esc(ch.agents.join(', ')) : 'the agents'}, and its files are removed for good. A channel made again under this name starts empty.<br>` +
+      `<button class="chip no" data-delete-now="${esc(ch.id)}">Delete #${esc(ch.id)}</button><button class="chip" data-delete-cancel="1">Cancel</button></div>`
+    $('head').innerHTML = `<div class="avatars">${people.map(p => avatar(p, true)).join('')}</div><div class="title">${esc(ch.group ? '#' + ch.id + ' · ' + people.join(', ') : people.join(' & '))}${delButton}</div>${sub}${delBox}<div class="toast" id="toast"></div>`
     let html = '', prev = null
     for (let i = 0; i < thread.length; i++) {
       const m = thread[i], next = thread[i + 1]
@@ -399,7 +408,7 @@
   }
 
   const openConv = async id => {
-    chosen = id; declining = ''
+    chosen = id; declining = ''; deleting = ''
     const thread = (data && data.threads[id]) || []
     const fresh = thread.find(m => m.fresh && !m.setup)
     const target = fresh || thread.find(m => m.pending)
@@ -419,6 +428,10 @@
     if (d.tab) return void openConv(d.tab)
     if (d.mode) return void act('/api/settings', { reviewer_mode: d.mode })
     if (d.direct) return void act('/api/direct', {}).then(() => openConv('direct'))
+    if (d.deleteOpen) { deleting = d.deleteOpen; render(false); return }
+    if (d.deleteCancel) { deleting = ''; render(false); return }
+    if (d.deleteNow) { const id = d.deleteNow; deleting = ''; return void act('/api/delete', { channel: id }) }
+    if (d.purge) return void act('/api/purge', {})
     if (d.approve) return void act('/api/approve', { id: d.approve })
     if (d.hold) return void act('/api/hold', { id: d.hold })
     if (d.decline) { declining = d.decline; render(false); const r = $('reason'); if (r) { r.scrollIntoView({ block: 'center' }); r.focus({ preventScroll: true }) } return }
@@ -434,7 +447,7 @@
       if (c) { e.preventDefault(); openConv(c.id) }
       return
     }
-    if (e.key === 'Escape' && declining) { declining = ''; render(false) }
+    if (e.key === 'Escape' && (declining || deleting)) { declining = ''; deleting = ''; render(false) }
   })
 
   const openSheet = () => {

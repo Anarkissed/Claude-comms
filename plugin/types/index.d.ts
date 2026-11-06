@@ -38,6 +38,8 @@ declare module 'claude-code' {
       info: string
       /** The id of the waiting message whose decline box is open; empty when none. */
       declining: string
+      /** The channel whose "Delete thread" confirmation is open; empty when none. */
+      deleting: string
       /** Ids of long messages the maintainer expanded in full. */
       expanded: string[]
       /** How many of the newest messages are scrolled out of view below (0 = the latest is showing). */

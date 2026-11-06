@@ -45,6 +45,8 @@ The five commands are files in `commands/`, marked `disable-model-invocation` so
 
 **Approve, Hold, Decline.** A reviewer's message to an agent waits for you; one to another reviewer or to you does not. **Hold** keeps it waiting and tells the reviewer and the agent (in a group, the group, without the text) to expect word from you. **Decline** never delivers it: the reviewer is told why; the agent is told nothing, unless the message was on hold, in which case it is told only that it was declined and nothing is coming. A hold is a file (`held/<id>.json`), so the pane and the web desk share it.
 
+**Delete thread.** When a channel is no longer in use (its PR merged, a group finished), open it and press **Delete thread**, then confirm. It leaves `channels.json`, so it's gone from your pane, the web desk and the agent's tools, and a `deleted.json` in its folder lists every message file it held, which stay hidden: a channel made again under that name starts empty, with a new setup note. Claude Code's file API can't delete files, so the pane leaves the messages on disk; the web desk's **Delete thread** removes them, and its **Remove files** cleans up threads deleted in the pane. `#direct` (you and the reviewer) can't be deleted, nor can a channel whose folder another channel shares (on macOS and Windows, `#Team` and `#team` are one folder).
+
 ## Settings
 
 One setting, **Comms folder** (`userConfig` `folder`): where the channels and messages are kept. Leave it empty for `agent-comms` in your home folder. Change it in `/config`, or under `pluginConfigs` in `settings.json`. If you change it and use the web desk, start the desk with `AGENT_COMMS_ROOT` set to the same folder.
@@ -59,7 +61,7 @@ Nothing leaves your computer through the plugin itself. The only way its data mo
 
 ### What it reads
 
-- **The comms folder:** `channels.json` and the message, approval and decline files in it.
+- **The comms folder:** `channels.json` and the message, approval, decline and hold files in it, and each channel's `deleted.json` (the mark of a deleted thread).
 - **Its own store** (`$.store`): each session's identity, and the ids of messages already delivered, announced, held or used to wake it. In the desktop app these are kept under the app's session id, which lasts across restarts; in a terminal, under the transcript id. `/comms-as <agent>` takes over the records of that agent's earlier sessions, so nothing is delivered twice.
 - **Its earlier store file:** when installed from a marketplace, it lists Claude Code's plugin store folder (`~/.claude/plugins/store/`) to find the store it kept while loaded as a folder (`agent-comms_inline-*.json`), and reads only that file, at each start and at `/comms-as <agent>`, to carry a session's identity and delivery record over. It never writes or deletes that file, and reads no other file there.
 - **The conversation:** only through its own tools' calls (`comms_read`, `comms_post`) and the tool calls its guard checks. It reads no other files.
@@ -74,8 +76,11 @@ The plugin reads no credentials: no API keys, tokens, passwords, cookies, SSH or
 
 Only inside the comms folder, with the file API (`$.fs.write`), and only these paths:
 
-- `<comms folder>/channels.json`, when `/comms-setup`, `/comms-as <new agent>` or `/comms-group` adds a channel (existing entries are kept);
-- `<comms folder>/channels/<channel>/messages/<id>.json`, one new file per message, and `.../approvals/<id>.json`, `.../declined/<id>.json` and `.../held/<id>.json`, one per approval, decline or hold. None is ever deleted. A message is never edited; a hold record is rewritten as its notes go out, and an approval or decline file that does not parse (half written, or not the maintainer's) is replaced by the maintainer's own.
+- `<comms folder>/channels.json`, when `/comms-setup`, `/comms-as <new agent>` or `/comms-group` adds a channel (existing entries are kept), and when you delete a thread (only that channel's entry is removed);
+- `<comms folder>/channels/<channel>/messages/<id>.json`, one new file per message, and `.../approvals/<id>.json`, `.../declined/<id>.json` and `.../held/<id>.json`, one per approval, decline or hold;
+- `<comms folder>/channels/<channel>/deleted.json` (`{"id", "by": "maintainer", "ts", "files"}`, `files` being the message files the thread held), when you delete that thread.
+
+The plugin deletes no file (Claude Code's file API has no way to). A message is never edited; a hold record is rewritten as its notes go out, and an approval or decline file that does not parse (half written, or not the maintainer's) is replaced by the maintainer's own.
 
 `<comms folder>` is the **Comms folder** setting, or `agent-comms` in your home folder, and `<id>` is a time stamp, the sender and six random hex characters. A channel's folders come into being with its first file. The plugin is not meant to edit any build, start-up, settings or instruction file, and never does: it writes nothing outside the comms folder (its own store aside, which Claude Code keeps), and it refuses to create the comms folder inside a git repository (it checks for a `.git` entry in the folder and the folders above it). A reader that catches a file mid-write sees JSON that doesn't parse yet; the plugin reads it again once it's complete.
 
@@ -132,4 +137,4 @@ Questions and bugs: [GitHub issues](https://github.com/Anarkissed/Claude-comms/i
 
 ## Development
 
-`claude plugin validate --strict .` and `claude plugin test .` (184 tests, including Windows paths). Needs Claude Code 2.1.293 or later to run. Validated with Claude Code 2.1.295 (`--strict`) and 2.1.278 (whose only warnings are the directory listing fields, which it doesn't know yet).
+`claude plugin validate --strict .` and `claude plugin test .` (193 tests, including Windows paths). Needs Claude Code 2.1.293 or later to run. Validated with Claude Code 2.1.317 (`--strict`) and 2.1.278 (whose only warnings are the directory listing fields, which it doesn't know yet).

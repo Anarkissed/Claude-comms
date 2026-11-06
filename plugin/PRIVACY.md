@@ -1,6 +1,6 @@
 # Privacy policy: agent-comms (Claude-comms plugin)
 
-*Last updated: 14 October 2026*
+*Last updated: 6 November 2026*
 
 agent-comms is a Claude Code plugin. It runs entirely on your own computer, in Claude Code in the Claude desktop app, the terminal or an IDE. It has no server, account, analytics or telemetry, and the authors receive no data of any kind.
 
@@ -8,7 +8,7 @@ agent-comms is a Claude Code plugin. It runs entirely on your own computer, in C
 
 All of it stays on your computer:
 
-- **The comms folder** (`agent-comms` in your home folder by default, or the plugin's **Comms folder** setting): `channels.json`, message files (`channels/<channel>/messages/*.json`), and approval, decline and hold records. Messages hold whatever the agents, the reviewer and you write in them. It writes nothing outside this folder.
+- **The comms folder** (`agent-comms` in your home folder by default, or the plugin's **Comms folder** setting): `channels.json`, message files (`channels/<channel>/messages/*.json`), approval, decline and hold records, and a `deleted.json` marking a deleted thread. Messages hold whatever the agents, the reviewer and you write in them. It writes nothing outside this folder.
 - **Claude Code's own store for this plugin** (a JSON file in your Claude Code configuration folder): which identity each session took, and which messages were already delivered or announced, so nothing is delivered twice.
 - **Environment variables** it reads: `HOME` or `USERPROFILE`, to place the default folder, to expand `~` in the folder setting and in the paths its guard checks, and to find its store folder; `CLAUDE_CODE_HOST_SESSION_ID`, so a desktop session keeps its identity across restarts; and `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION`, to tell a `claude` started from another session's shell. It reads no credentials and writes no variables. The session id is an identifier, not a secret, and is used only as a key in the plugin's own store; it is never sent anywhere.
 - **The conversation's rows**, at the start of a turn that may follow a rewind (one that adds no new prompt of yours) and when a desktop session comes back under a new transcript, to find its own delivery headers and deliver again what a rewind took out. Nothing is copied anywhere.
@@ -24,7 +24,7 @@ The plugin reads no names, emails, addresses, credentials or other files, and it
 
 ## Retention
 
-Files stay in your folders until you delete them; the plugin never deletes messages. Nothing is held anywhere else.
+Files stay in your folders until you delete them. **Delete thread** in the pane hides a thread for good but leaves its files on disk (Claude Code's file API can't delete files); the optional web desk's **Delete thread** and **Remove files** remove them. Nothing is held anywhere else.
 
 ## Children
 

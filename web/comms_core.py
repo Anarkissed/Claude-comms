@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -366,8 +367,11 @@ class Folder:
         d = self.channel_dir(channel["id"], "messages")
         messages, skipped = [], 0
         missing = not os.path.isdir(d)
+        # a thread deleted earlier (deleted.json): the files it held are gone, readable or not, so a channel
+        # made again under the name starts empty; while the mark can't be read, nothing of it is shown
+        hidden = self.hidden_files(channel["id"])
         for name in sorted(os.listdir(d)) if not missing else []:
-            if not is_candidate(name):
+            if not is_candidate(name) or hidden is None or name in hidden:
                 continue
             try:
                 with open(os.path.join(d, name), encoding="utf-8") as handle:
@@ -382,6 +386,125 @@ class Folder:
         approved = set(self._records(channel["id"], "approvals"))
         declined = {k: str(v.get("reason", "")) for k, v in self._records(channel["id"], "declined").items()}
         return messages, skipped, missing, approved, declined
+
+    def channel_folder(self, ch: str) -> str:
+        return os.path.join(self.root, "channels", ch)
+
+    def _read_mark(self, ch: str) -> Tuple[bool, Optional[str]]:
+        """Whether channels/<ch>/deleted.json is there, and its text (None when it can't be read)."""
+        path = os.path.join(self.channel_folder(ch), "deleted.json")
+        if not os.path.lexists(path):
+            return False, None
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return True, handle.read()
+        except (OSError, UnicodeDecodeError):
+            return True, None
+
+    @staticmethod
+    def _mark_files(text: Optional[str]) -> Optional[Set[str]]:
+        """A deletion mark's "files", or None when the text is not one (half written, or not this record)."""
+        try:
+            value = json.loads(text) if text is not None else None
+        except ValueError:
+            return None
+        files = value.get("files") if isinstance(value, dict) else None
+        return set(f for f in files if isinstance(f, str)) if isinstance(files, list) else None
+
+    def hidden_files(self, ch: str) -> Optional[Set[str]]:
+        """The message files a deleted thread on `ch` held: empty when it was never deleted; None while the
+        mark is there but can't be read (busy, half written), so nothing of the old thread shows meanwhile."""
+        there, text = self._read_mark(ch)
+        if not there:
+            return set()
+        return self._mark_files(text)
+
+    def _own_folder(self, ch: str) -> bool:
+        """channels/<ch> is a real folder of its own right inside channels/ (no link or junction to elsewhere)."""
+        folder = self.channel_folder(ch)
+        if os.path.islink(folder) or not os.path.isdir(folder):
+            return False
+        return os.path.dirname(os.path.realpath(folder)) == os.path.realpath(os.path.join(self.root, "channels"))
+
+    @staticmethod
+    def _twin(cfg: Dict[str, Any], ch: str) -> Optional[str]:
+        """Another channel whose folder is the same one where folders ignore case (macOS, Windows)."""
+        return next((c["id"] for c in cfg["channels"] if c["id"] != ch and c["id"].casefold() == ch.casefold()), None)
+
+    def deleted_on_disk(self, cfg: Dict[str, Any]) -> List[str]:
+        """Threads deleted in the plugin's pane (which cannot delete files) whose folders are still on disk: a
+        folder with a deletion mark that no channel in channels.json uses, in any case."""
+        d = os.path.join(self.root, "channels")
+        listed = set(c["id"].casefold() for c in cfg["channels"])
+        out = []
+        for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            if name.casefold() in listed or name.startswith(".") or not self._own_folder(name):
+                continue
+            if os.path.isfile(os.path.join(d, name, "deleted.json")):
+                out.append(name)
+        return out
+
+    def _remove_folder(self, ch: str) -> bool:
+        """Removes channels/<ch>/ and everything in it; only a folder of its own (never a link). True when removed."""
+        if not self._own_folder(ch):
+            return False
+        shutil.rmtree(self.channel_folder(ch))
+        return True
+
+    def delete_channel(self, ch: str) -> str:
+        """Delete a thread: the channel leaves channels.json (gone from both desks and from the agents), and
+        its folder, every message and record in it, is removed. A channel made again under the name starts empty."""
+        with _ACTION_LOCK:
+            return self._delete_channel(ch)
+
+    def _delete_channel(self, ch: str) -> str:
+        if ch.casefold() == DIRECT:
+            return "#direct is your private chat with the reviewer; it stays."
+        cfg = self.config()
+        if cfg is None or not any(c["id"] == ch for c in cfg["channels"]):
+            return f"#{ch} is not in channels.json."
+        twin = self._twin(cfg, ch)
+        if twin is not None:
+            return f"Not deleted: #{ch} shares its folder with #{twin}."
+        folder = self.channel_folder(ch)
+        if os.path.lexists(folder) and not self._own_folder(ch):
+            return f"Not deleted: channels/{ch} is a link to another folder; it was left alone."
+        # marked first, as the pane does, with every file the thread holds: should channels.json not change,
+        # the mark is put back as it was; should the folder not go, the thread still reads as deleted
+        there, before = self._read_mark(ch)
+        earlier = self._mark_files(before) or set()
+        d = self.channel_dir(ch, "messages")
+        held = set(n for n in os.listdir(d) if is_candidate(n)) if os.path.isdir(d) else set()
+        stamp = iso_now()
+        write_atomic(folder, "deleted.json", dumps({"id": ch, "by": MAINTAINER, "ts": stamp, "files": sorted(earlier | held)}) + "\n", replace=True)
+
+        def drop(raw):
+            raw["channels"] = [c for c in raw.get("channels", []) if not (isinstance(c, dict) and c.get("id") == ch)]
+            return None
+
+        why = self._update_config(drop)
+        if why:
+            if there and before is not None:
+                write_atomic(folder, "deleted.json", before, replace=True)
+            else:
+                os.remove(os.path.join(folder, "deleted.json"))
+            return f"Not deleted: {why}"
+        self._remove_folder(ch)
+        state = self.state()
+        seen = state.get("seen", {})
+        if isinstance(seen, dict) and ch in seen:
+            del seen[ch]
+            self.save_state(state)
+        return f"🗑 Deleted #{ch}: it is gone from both desks and from the agents, and its files are removed."
+
+    def purge_deleted(self) -> str:
+        """Removes the folders of threads deleted in the pane (still marked deleted, used by no channel)."""
+        with _ACTION_LOCK:
+            cfg = self.config()
+            if cfg is None:
+                return "channels.json is missing or unreadable."
+            removed = [ch for ch in self.deleted_on_disk(cfg) if self._remove_folder(ch)]
+            return f"Removed the files of {len(removed)} deleted thread{'' if len(removed) == 1 else 's'}." if removed else "No files of deleted threads are left."
 
     def snapshot(self) -> Dict[str, Any]:
         cfg = self.config()
@@ -449,6 +572,7 @@ class Folder:
             "agents": self.known_agents(),
             "reviewer_mode": cfg["reviewer_mode"],
             "has_direct": any(c["id"] == DIRECT for c in cfg["channels"]),
+            "deleted_on_disk": self.deleted_on_disk(cfg),
         }
 
     # ---- the maintainer's actions
