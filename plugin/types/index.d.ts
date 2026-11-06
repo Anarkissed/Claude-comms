@@ -31,7 +31,7 @@ export type CommsThreadItem = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'comms': {
+    'agent-comms': {
       channels: CommsChannelRow[]
       threads: Record<string, CommsThreadItem[]>
       selected: string

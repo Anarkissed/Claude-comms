@@ -363,4 +363,4 @@ export const commandMentionsRoot = (command: string, spellings: readonly string[
 }
 
 export const denyText = (root: string): string =>
-  `comms: ${root} is written only through the comms tools. Use comms_post to send a message and comms_read to read yours; do not create, change, move or delete files there (approvals are the maintainer's, from the /comms pane).`
+  `agent-comms: ${root} is written only through the comms tools. Use comms_post to send a message and comms_read to read yours; do not create, change, move or delete files there (approvals are the maintainer's, from the /comms pane).`

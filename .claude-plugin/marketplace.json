@@ -6,12 +6,11 @@
     "url": "https://github.com/Anarkissed"
   },
   "renames": {
-    "agent-comms": "comms"
+    "comms": "agent-comms"
   },
   "plugins": [
     {
-      "name": "comms",
-      "displayName": "Comms",
+      "name": "agent-comms",
       "source": "./plugin",
       "description": "Message channels between your Claude Code sessions (coding agents, a reviewer and you), kept as JSON files in a local folder; a reviewer's message reaches an agent only after you approve it."
     }

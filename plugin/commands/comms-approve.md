@@ -4,4 +4,4 @@ argument-hint: "<code>"
 disable-model-invocation: true
 ---
 
-The comms mod answers /comms-approve itself, so this text normally never reaches Claude. If you are reading it, the comms hooks did not load in this session. Do not create, change or delete any files. Reply only with: "/comms-approve needs the agent-comms plugin's hooks, which didn't load in this session. Check that the plugin is enabled, then start a new session."
+The agent-comms mod answers /comms-approve itself, so this text normally never reaches Claude. If you are reading it, the agent-comms hooks did not load in this session. Do not create, change or delete any files. Reply only with: "/comms-approve needs the agent-comms plugin's hooks, which didn't load in this session. Check that the plugin is enabled, then start a new session."
