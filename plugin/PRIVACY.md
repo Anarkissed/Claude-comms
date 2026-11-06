@@ -1,8 +1,8 @@
-# Privacy policy: agent-comms (Claude-comms plugin)
+# Privacy policy: Comms (Claude-comms plugin)
 
 *Last updated: 6 November 2026*
 
-agent-comms is a Claude Code plugin. It runs entirely on your own computer, in Claude Code in the Claude desktop app, the terminal or an IDE. It has no server, account, analytics or telemetry, and the authors receive no data of any kind.
+Comms (formerly agent-comms) is a Claude Code plugin. It runs entirely on your own computer, in Claude Code in the Claude desktop app, the terminal or an IDE. It has no server, account, analytics or telemetry, and the authors receive no data of any kind.
 
 ## What it reads and writes
 
@@ -12,7 +12,7 @@ All of it stays on your computer:
 - **Claude Code's own store for this plugin** (a JSON file in your Claude Code configuration folder): which identity each session took, and which messages were already delivered or announced, so nothing is delivered twice.
 - **Environment variables** it reads: `HOME` or `USERPROFILE`, to place the default folder, to expand `~` in the folder setting and in the paths its guard checks, and to find its store folder; `CLAUDE_CODE_HOST_SESSION_ID`, so a desktop session keeps its identity across restarts; and `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION`, to tell a `claude` started from another session's shell. It reads no credentials and writes no variables. The session id is an identifier, not a secret, and is used only as a key in the plugin's own store; it is never sent anywhere.
 - **The conversation's rows**, at the start of a turn that may follow a rewind (one that adds no new prompt of yours) and when a desktop session comes back under a new transcript, to find its own delivery headers and deliver again what a rewind took out. Nothing is copied anywhere.
-- **Its earlier store file**, when it was used before as a folder-loaded copy: it lists Claude Code's plugin store folder (`~/.claude/plugins/store/`) to find `agent-comms_inline-*.json` and reads only that file, to carry its own session records over. It reads no other file there.
+- **Its earlier store file**, when it was used before as a folder-loaded copy: it lists Claude Code's plugin store folder (`~/.claude/plugins/store/`) to find `comms_inline-*.json` (or `agent-comms_inline-*.json`, from before the rename) and reads only that file, to carry its own session records over. It reads no other file there.
 - **Programs:** it runs none.
 
 The plugin reads no names, emails, addresses, credentials or other files, and it uses no connectors or MCP servers.
@@ -28,7 +28,7 @@ Files stay in your folders until you delete them. **Delete thread** in the pane 
 
 ## Children
 
-agent-comms is a developer tool and isn't intended for anyone under 18.
+Comms is a developer tool and isn't intended for anyone under 18.
 
 ## Contact
 

@@ -50,3 +50,9 @@ claude plugin validate plugin          # 2.1.278 on PATH: must pass (warnings on
 | "Uses a credential from the user's machine" | Kept, reviewer confirms (see above). README section "Credentials". |
 | "Unrecognized field in plugin.json" (5) / "Field from another tool's manifest: icon" | Keep: the directory reads these listing fields itself; 2.1.278 just predates them (2.1.281 knows them). |
 | "Validation didn't finish on this commit" | Nothing to change; resubmitted with the error fixed. |
+
+## Withdrawn (6 November 2026), and the rename
+
+v0.3.0 was refused by directory policy: the directory now takes **mods** (a `modules` entry in `hooks/hooks.json`) and any file outside Markdown, text, JSON, YAML and a few image types **only from Verified organizations**, and there is no application for Verified. Removing the hooks module would remove the whole plugin, so the submission was withdrawn. The plugin is shared through this repository's marketplace instead (`/plugin install comms --marketplace Anarkissed/Claude-comms`).
+
+In v0.4.0 the plugin was renamed from `agent-comms` to `comms` (display name "Comms"); `claude-comms` is refused by `claude plugin validate`, which reserves the `claude-` prefix. The marketplace's `renames` map moves existing installs over, and the plugin imports its records from the old store file, so sessions keep their identities. The comms folder (`~/agent-comms`), the file format, the `[agent-comms setup]` marker and the web desk keep their names, so no data moves.

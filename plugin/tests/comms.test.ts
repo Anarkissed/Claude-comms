@@ -300,7 +300,7 @@ const world = (on: On, options: WorldOptions = {}): World => {
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => {
     w.tools.push(e.name)
-    return { value: { tool: `mcp__agent-comms__${e.name}` } }
+    return { value: { tool: `mcp__comms__${e.name}` } }
   })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* ($, e) {
@@ -319,11 +319,11 @@ const msgDir = (ch: string) => `${ROOT}/channels/${ch}/messages`
 const apprDir = (ch: string) => `${ROOT}/channels/${ch}/approvals`
 
 const PERSON = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: true, columns: 160 } }
-const PANE_PROPS = { title: 'agent-comms', isFocused: true, bodyColumns: 120, placement: 'dock' as const, scroll: { offset: 0, bodyRows: 60 }, view: {} }
+const PANE_PROPS = { title: 'comms', isFocused: true, bodyColumns: 120, placement: 'dock' as const, scroll: { offset: 0, bodyRows: 60 }, view: {} }
 
 /** The channel rows of the maintainer's pane, as drawn on the terminal. */
 const paneRows = async ($: Engine): Promise<string[]> => {
-  const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'terminal', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+  const ui = await $.ui.mount({ plugin: 'comms', surface: 'terminal', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
   const rows = (await ui.findAll({ type: 'Button' })).map(b => b.text).filter(t => t.startsWith('#'))
   const texts = [...(await ui.findAll({ type: 'Text' })), ...(await ui.findAll({ type: 'Markdown' }))].map(t => t.text)
   await ui.unmount()
@@ -387,7 +387,7 @@ describe('2. atomic write', () => {
   test('a message is written straight to its name with the file API; the plugin runs no program', async ($, on) => {
     const w = world(on, { identity: '358' })
     await start($)
-    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'report', text: 'build is green' })
+    const posted = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'report', text: 'build is green' })
     expect(denial(posted)).toBeUndefined()
     const finals = [...w.files.keys()].filter(p => p.startsWith(msgDir('358')))
     expect(finals).toHaveLength(1)
@@ -431,7 +431,7 @@ describe('3. approval gate', () => {
     await turn($, 1)
     expect(w.appended).toHaveLength(0)
     expect(w.status()).toBe('comms #358: 0 new')
-    const read1 = await $.tool.call({ tool: 'mcp__agent-comms__comms_read' })
+    const read1 = await $.tool.call({ tool: 'mcp__comms__comms_read' })
     expect(read1.result).toBe('No unread messages.')
 
     // an approval NOT by the maintainer does not count
@@ -450,7 +450,7 @@ describe('3. approval gate', () => {
     await turn($, 4)
     await turn($, 5)
     expect(w.appended).toHaveLength(1)
-    const read2 = await $.tool.call({ tool: 'mcp__agent-comms__comms_read' })
+    const read2 = await $.tool.call({ tool: 'mcp__comms__comms_read' })
     expect(read2.result).toBe('No unread messages.')
   })
 
@@ -463,7 +463,7 @@ describe('3. approval gate', () => {
     expect(w.status()).toBe('comms #358: 2 new')
     expect(w.toasts.some(t => t.includes('#358'))).toBe(true)
     expect(w.appended).toHaveLength(0) // idle: nothing injected until a turn starts
-    const read = await $.tool.call({ tool: 'mcp__agent-comms__comms_read', channel: '358' })
+    const read = await $.tool.call({ tool: 'mcp__comms__comms_read', channel: '358' })
     expect(String(read.result)).toContain('ok to merge')
     expect(String(read.result)).toContain(maint.body)
     expect(w.status()).toBe('comms #358: 0 new')
@@ -479,7 +479,7 @@ describe('4. comms_post', () => {
   test('writes the exact format into its own channel', async ($, on) => {
     const w = world(on, { identity: '358' })
     await start($)
-    const r = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'question', text: 'Is 3 retries the limit?' })
+    const r = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'question', text: 'Is 3 retries the limit?' })
     expect(denial(r)).toBeUndefined()
     const [path] = [...w.files.keys()].filter(p => p.startsWith(msgDir('358')))
     const name = nameOf(path ?? '')
@@ -493,11 +493,11 @@ describe('4. comms_post', () => {
   test('refuses a recipient or channel outside its own', async ($, on) => {
     const w = world(on, { identity: '358' })
     await start($)
-    const toAgent = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: '362', kind: 'note', text: 'hi' })
+    const toAgent = await $.tool.call({ tool: 'mcp__comms__comms_post', to: '362', kind: 'note', text: 'hi' })
     expect(denial(toAgent)).toContain('not in any of your channels')
-    const otherChannel = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'note', text: 'hi', channel: '354' })
+    const otherChannel = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'note', text: 'hi', channel: '354' })
     expect(denial(otherChannel)).toContain('not in any of your channels')
-    const badKind = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'shout', text: 'hi' })
+    const badKind = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'shout', text: 'hi' })
     expect(denial(badKind)).toContain('kind')
     expect([...w.files.keys()].filter(p => p.includes('/messages/'))).toHaveLength(0)
   })
@@ -611,19 +611,19 @@ describe('5. tool.call guard', () => {
     const w = world(on, { identity: '358' })
     put(w, '/w/elsewhere/channels.json', JSON.stringify(DEFAULT_CONFIG))
     await start($)
-    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'note', text: 'moved' })
+    const posted = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'note', text: 'moved' })
     expect(denial(posted)).toBeUndefined()
     expect([...w.files.keys()].some(p => p.startsWith('/w/elsewhere/channels/358/messages/'))).toBe(true)
     expect([...w.files.keys()].some(p => p.startsWith(`${msgDir('358')}/`))).toBe(false)
   })
 
-  test('a command typed as agent-comms:<name> is answered the same as the plain name', async ($, on) => {
+  test('a command typed as comms:<name> is answered the same as the plain name', async ($, on) => {
     world(on)
     const plain = await $.command.run({ command: 'comms-as', args: '', ...PERSON })
-    const spaced = await $.command.run({ command: 'agent-comms:comms-as', args: '', ...PERSON })
+    const spaced = await $.command.run({ command: 'comms:comms-as', args: '', ...PERSON })
     expect(plain.text).toContain('not joined')
     expect(spaced.text).toBe(plain.text)
-    const joined = await $.command.run({ command: 'agent-comms:comms-as', args: '358', ...PERSON })
+    const joined = await $.command.run({ command: 'comms:comms-as', args: '358', ...PERSON })
     expect(joined.text).toContain('this session is 358')
   })
 
@@ -651,9 +651,9 @@ describe('6. identity', () => {
     await turn($, 2)
     expect(w.appended).toEqual([])
     expect(w.lists.length).toBe(listed)
-    const read = await $.tool.call({ tool: 'mcp__agent-comms__comms_read' })
+    const read = await $.tool.call({ tool: 'mcp__comms__comms_read' })
     expect(denial(read)).toContain('has not joined')
-    const post = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'note', text: 'hi' })
+    const post = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'note', text: 'hi' })
     expect(denial(post)).toContain('has not joined')
     const shown = await $.command.run({ command: 'comms-as', args: '', ...PERSON })
     expect(shown.text).toContain('not joined')
@@ -690,9 +690,9 @@ describe('6. identity', () => {
     for (const p of touched) expect(p.startsWith(`${ROOT}/channels/358/`)).toBe(true)
     // joining wrote #358's setup note (it had none): its one unread message
     expect(w.status()).toBe('comms #358: 1 new')
-    const r = await $.tool.call({ tool: 'mcp__agent-comms__comms_read', channel: '354' })
+    const r = await $.tool.call({ tool: 'mcp__comms__comms_read', channel: '354' })
     expect(denial(r)).toContain('not a member')
-    const all = await $.tool.call({ tool: 'mcp__agent-comms__comms_read' })
+    const all = await $.tool.call({ tool: 'mcp__comms__comms_read' })
     expect(String(all.result)).toContain('[agent-comms setup] Channel #358')
     expect(String(all.result)).not.toContain('for 354 only')
     expect(w.status()).toBe('comms #358: 0 new')
@@ -763,7 +763,7 @@ describe('6c. named reviewers (Reviewer3)', () => {
     expect(w.files.get(`${ROOT}/channels.json`)).toBe(before)
     expect([...w.files.keys()].filter(p => p.includes('/messages/'))).toHaveLength(0)
     expect(w.tools).toEqual(['comms_read', 'comms_post'])
-    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: '358', kind: 'ruling', text: 'Split the PR.' })
+    const posted = await $.tool.call({ tool: 'mcp__comms__comms_post', to: '358', kind: 'ruling', text: 'Split the PR.' })
     expect(denial(posted)).toBeUndefined()
     const [path] = [...w.files.keys()].filter(p => p.startsWith(`${msgDir('358')}/`))
     expect(nameOf(path ?? '')).toContain('-Reviewer3-')
@@ -782,7 +782,7 @@ describe('6c. named reviewers (Reviewer3)', () => {
     expect(w.appended).toHaveLength(1)
     expect(w.appended[0]).toContain('from "Reviewer3"')
     expect(w.appended[0]).toContain('Approved by the maintainer')
-    const reply = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'Reviewer3', kind: 'answer', text: 'Splitting now.' })
+    const reply = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'Reviewer3', kind: 'answer', text: 'Splitting now.' })
     expect(denial(reply)).toBeUndefined()
     const replyPath = [...w.files.keys()].find(p => p.startsWith(`${msgDir('358')}/`) && p.includes('-358-'))
     const parsed = parse(w.files.get(replyPath ?? '') ?? '', nameOf(replyPath ?? '').slice(0, -5))
@@ -796,10 +796,10 @@ describe('6c. named reviewers (Reviewer3)', () => {
     await start($)
     // addressed to the cloud reviewer, not by name: not reviewer3's
     seedMessage(w, '361', { from: '361', to: 'reviewer', kind: 'question', body: 'for the cloud reviewer', at: T0 - 1500, hex: 'rev305' })
-    const read = await $.tool.call({ tool: 'mcp__agent-comms__comms_read' })
+    const read = await $.tool.call({ tool: 'mcp__comms__comms_read' })
     expect(String(read.result)).toContain('Which flag name?')
     expect(String(read.result)).not.toContain('for the cloud reviewer')
-    expect(String(read.result)).toContain('Delivered by agent-comms.')
+    expect(String(read.result)).toContain('Delivered by comms.')
   })
 })
 
@@ -813,7 +813,7 @@ describe('6e. the plain reviewer moves from one chat to the next', () => {
     expect(joined.text).toContain('Reviewer in #358, #354, #361, #362')
     await turn($, 1)
     expect(w.appended.some(t => t.includes('earlier question'))).toBe(true)
-    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: '358', kind: 'ruling', text: 'Go ahead.' })
+    const posted = await $.tool.call({ tool: 'mcp__comms__comms_post', to: '358', kind: 'ruling', text: 'Go ahead.' })
     expect(denial(posted)).toBeUndefined()
     const left = await $.command.run({ command: 'comms-as', args: 'off', ...PERSON })
     expect(left.text).toContain('no longer reviewer')
@@ -842,8 +842,8 @@ describe('maintainer pane', () => {
       await start($)
       expect(w.status()).toBe('comms: 1 awaiting approval (/comms)')
       const opened = await $.command.run({ command: 'comms', args: '', ...PERSON })
-      expect(opened.text).toBe('agent-comms pane opened.')
-      const ui = await $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+      expect(opened.text).toBe('comms pane opened.')
+      const ui = await $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: PANE_PROPS })
       expect(await ui.find({ type: 'Text', text: /Waiting for your approval/ })).toBeDefined()
       // a message waiting for approval is drawn verbatim (Text), exactly as the agent will receive it
       expect(await ui.find({ type: 'Text', text: `ruling for ${surface}` })).toBeDefined()
@@ -872,7 +872,7 @@ describe('maintainer pane on the mobile app', () => {
     const w = world(on, { identity: 'maintainer' })
     const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: '**Split** the PR.', at: T0 - 1000, hex: 'mob001' })
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'mobile', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'mobile', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     expect(await ui.find({ type: 'Text', text: '**Split** the PR.' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /Waiting for your approval/ })).toBeDefined()
     expect(await ui.find({ type: 'Input' })).toBeUndefined()
@@ -893,7 +893,7 @@ describe('pane round 3: setup notes, writing to the reviewer, the phone', () => 
     const w = world(on, { identity: 'maintainer' })
     setupNote(w, '358')
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     expect(await ui.find({ type: 'Text', text: /Channel set up · the format guide was sent to 358/ })).toBeDefined()
     expect(await ui.find({ type: 'Markdown', text: /JSON/ })).toBeUndefined()
     await ui.unmount()
@@ -902,7 +902,7 @@ describe('pane round 3: setup notes, writing to the reviewer, the phone', () => 
   test('the maintainer writes to the reviewer from the pane; it needs no approval', async ($, on) => {
     const w = world(on, { identity: 'maintainer' })
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.input({ key: 'post:358:reviewer', text: 'question: is 358 ready to merge?' })
     const [entry] = [...w.files.entries()].filter(([p]) => p.startsWith(`${msgDir('358')}/`))
     const parsed = parse(entry?.[1] ?? '', nameOf(entry?.[0] ?? '').slice(0, -5))
@@ -917,7 +917,7 @@ describe('pane round 3: setup notes, writing to the reviewer, the phone', () => 
     const m = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'Split the PR.', at: T0 - 1000, hex: 'c0de01' })
     await start($)
     const r = await $.command.run({ command: 'comms', args: '', ...PERSON })
-    expect(r.text).toContain('agent-comms pane opened.')
+    expect(r.text).toContain('comms pane opened.')
     expect(r.text).toContain('**#358** · ⏳ 1 waiting for your approval')
     expect(r.text).toContain('> Split the PR.')
     expect(r.text).toContain('`/comms-approve c0de01`')
@@ -940,7 +940,7 @@ describe('pane round 3: setup notes, writing to the reviewer, the phone', () => 
     seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'Split the PR.', at: T0 - 1000, hex: 'c0de02' })
     await start($)
     const r = await $.command.run({ command: 'comms', args: '', ...PERSON })
-    expect(r.text).toBe('agent-comms pane opened.')
+    expect(r.text).toBe('comms pane opened.')
   })
 
   test('only the maintainer approves by code, and never the model', async ($, on) => {
@@ -982,7 +982,7 @@ describe('phone notices in the transcript', () => {
 
 describe('Hold and Decline', () => {
   const mount = ($: Engine, surface: 'terminal' | 'desktop' = 'desktop') =>
-    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: PANE_PROPS })
   const notesTo = (w: World, ch: string, to: string) =>
     [...w.files.entries()]
       .filter(([p]) => p.startsWith(`${msgDir(ch)}/`) && p.includes('-maintainer-'))
@@ -1069,7 +1069,7 @@ describe('reviewer messages to the maintainer', () => {
     const m = seedMessage(w, '358', { from: 'reviewer', to: 'maintainer', kind: 'note', body: 'Reviewer here, test.', at: T0 - 1000, hex: 'r2m001' })
     await start($)
     expect(w.status()).toBe('comms (maintainer): nothing awaiting approval')
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     expect(await ui.find({ key: `approve:${m.id}` })).toBeUndefined()
     expect(await ui.find({ key: `hold:${m.id}` })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: /could not be read/ })).toBeUndefined()
@@ -1091,7 +1091,7 @@ describe('reviewer fix list (#358 testing)', () => {
     const toAgent = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'to the agent', at: T0 - 2000, hex: 'fx0001' })
     const toYou = seedMessage(w, '358', { from: 'reviewer', to: 'maintainer', kind: 'note', body: 'to you', at: T0 - 1000, hex: 'fx0002' })
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     for (const key of ['approve', 'hold', 'decline-open']) {
       expect(await ui.find({ key: `${key}:${toAgent.id}` })).toBeDefined()
       expect(await ui.find({ key: `${key}:${toYou.id}` })).toBeUndefined()
@@ -1103,7 +1103,7 @@ describe('reviewer fix list (#358 testing)', () => {
     const w = world(on, { identity: 'maintainer' })
     const m = seedMessage(w, '358', { from: 'reviewer', to: '358', kind: 'question', body: 'held one', at: T0 - 1000, hex: 'fx0003' })
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.press({ key: `hold:${m.id}` })
     await ui.unmount()
     expect(notes(w, '358').filter(n => n.to === 'maintainer')).toEqual([])
@@ -1115,7 +1115,7 @@ describe('reviewer fix list (#358 testing)', () => {
     const answer = seedMessage(w, '358', { from: 'reviewer', to: '358', kind: 'question', body: 'q', at: T0 - 2000, hex: 'fx0004' })
     put(w, `${msgDir('358')}/${answer.id}.json`, format({ ...answer, kind: 'answer' }))
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.press({ key: `hold:${answer.id}` })
     await ui.unmount()
     const toAgent = notes(w, '358').find(n => n.to === '358')
@@ -1128,7 +1128,7 @@ describe('reviewer fix list (#358 testing)', () => {
     const first = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'first', at: T0 - 2000, hex: 'fx0005' })
     const second = seedMessage(w, '358', { from: 'reviewer', to: '358', body: 'second', at: T0 - 1000, hex: 'fx0006' })
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.press({ key: `hold:${first.id}` })
     expect(await ui.findAll({ type: 'Text', text: /⏸ On hold/ })).toHaveLength(1)
     expect(await ui.findAll({ type: 'Text', text: /⏳ Waiting for your approval/ })).toHaveLength(1)
@@ -1148,7 +1148,7 @@ describe('long and odd messages never take the pane down', () => {
     const m = seedMessage(w, '354', { from: '354', to: 'reviewer', kind: 'report', body: longBody, at: T0 - 1000, hex: 'l0ng01' })
     expect(m.body.length).toBeGreaterThan(25000)
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.press({ key: 'ch:354' })
     const collapsed = await ui.findAll({ type: 'Markdown' })
     expect(collapsed).toHaveLength(1)
@@ -1176,7 +1176,7 @@ describe('auto-wake: a delivered message starts a turn in an idle agent', () => 
     put(w, `${apprDir('358')}/${m.id}.json`, formatApproval({ id: m.id, by: 'maintainer', ts: '2026-10-03T12:00:02.000Z' }))
     await start($)
     expect(w.prompts).toEqual([
-      'A new agent-comms message for you on #358 (from reviewer). It follows this note; read it, act on it as your work allows, and reply with comms_post.',
+      'A new comms message for you on #358 (from reviewer). It follows this note; read it, act on it as your work allows, and reply with comms_post.',
     ])
     // while the woken turn has not started yet, later polls (or a reload) must not queue it again
     await start($)
@@ -1201,7 +1201,7 @@ describe('auto-wake: a delivered message starts a turn in an idle agent', () => 
     seedMessage(w, '354', { from: '354', to: 'reviewer', kind: 'question', body: 'Can I merge?', at: T0 - 1000, hex: 'wk0003' })
     await start($)
     expect(w.prompts).toEqual([
-      'A new agent-comms message for you on #354 (from 354). It follows this note; read it, act on it as your work allows, and reply with comms_post.',
+      'A new comms message for you on #354 (from 354). It follows this note; read it, act on it as your work allows, and reply with comms_post.',
     ])
   })
 
@@ -1252,7 +1252,7 @@ describe('auto-wake: a delivered message starts a turn in an idle agent', () => 
     expect(w.appended.some(t => t.includes('last-step note'))).toBe(true)
     await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
     expect(w.prompts).toEqual([
-      'A new agent-comms message for you on #358 (from maintainer). It reached you at the end of your last turn and is just above this note; read it, act on it as your work allows, and reply with comms_post.',
+      'A new comms message for you on #358 (from maintainer). It reached you at the end of your last turn and is just above this note; read it, act on it as your work allows, and reply with comms_post.',
     ])
     await w.clock.advance(60_000)
     expect(w.prompts).toHaveLength(1)
@@ -1267,7 +1267,7 @@ describe('pane header stays put; tabs jump to the new message', () => {
     }
     return out
   }
-  const mount = ($: Engine) => $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+  const mount = ($: Engine) => $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
   const bodies = async (ui: Awaited<ReturnType<typeof mount>>) => (await ui.findAll({ type: 'Markdown' })).map(m => m.text)
 
   test('the header (title, summary, tabs) is drawn whatever the scroll; the wheel moves only the messages', async ($, on) => {
@@ -1275,12 +1275,12 @@ describe('pane header stays put; tabs jump to the new message', () => {
     many(w, '358', 12)
     await start($)
     const ui = await mount($)
-    expect(await ui.find({ type: 'Text', text: '📬 agent-comms' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '📬 comms' })).toBeDefined()
     expect(await bodies(ui)).toContain('message 11')
     expect(await ui.find({ key: 'latest' })).toBeUndefined()
     // the person scrolls all the way up (Home: by = minus the content's rows)
     await $.ui.scroll({ component: 'Pane', requestId: 'comms', offset: 0, by: -200, bodyRows: 60, contentRows: 60, origin: { kind: 'person' } })
-    expect(await ui.find({ type: 'Text', text: '📬 agent-comms' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '📬 comms' })).toBeDefined()
     expect(await ui.find({ key: 'ch:358' })).toBeDefined()
     expect(await bodies(ui)).not.toContain('message 11')
     expect(await bodies(ui)).toContain('message 0')
@@ -1391,7 +1391,7 @@ describe('group chats (several agents and the reviewer)', () => {
   test('comms_post to "all" writes into the group; with no group it is refused', async ($, on) => {
     const w = world(on, { identity: '354', config: TEAM })
     await start($)
-    const ok = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'all', kind: 'question', text: 'Who owns the API client?' })
+    const ok = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'all', kind: 'question', text: 'Who owns the API client?' })
     expect(denial(ok)).toBeUndefined()
     expect(groupFiles(w).some(m => m.from === '354' && m.to === 'all' && m.body === 'Who owns the API client?')).toBe(true)
   })
@@ -1399,7 +1399,7 @@ describe('group chats (several agents and the reviewer)', () => {
   test('an agent in no group cannot post to "all"', async ($, on) => {
     world(on, { identity: '361', config: TEAM })
     await start($)
-    const r = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'all', kind: 'note', text: 'hi' })
+    const r = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'all', kind: 'note', text: 'hi' })
     expect(denial(r)).toContain('you are in no such group')
   })
 
@@ -1407,7 +1407,7 @@ describe('group chats (several agents and the reviewer)', () => {
     const w = world(on, { identity: 'maintainer', config: TEAM })
     const m = seedMessage(w, 'team', { from: 'reviewer', to: 'all', body: 'Freeze the API.', at: T0 - 1000, hex: 'grp009' })
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.press({ key: 'ch:team' })
     await ui.press({ key: `decline-open:${m.id}` })
     await ui.input({ key: `decline:${m.id}`, text: 'Not yet.' })
@@ -1421,7 +1421,7 @@ describe('group chats (several agents and the reviewer)', () => {
     const w = world(on, { identity: 'maintainer', config: TEAM })
     const m = seedMessage(w, 'team', { from: 'reviewer', to: 'all', body: 'Freeze the API.', at: T0 - 1000, hex: 'grp004' })
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.press({ key: 'ch:team' })
     expect(await ui.find({ key: 'post:team:all' })).toBeDefined()
     await ui.press({ key: `hold:${m.id}` })
@@ -1468,7 +1468,7 @@ describe('reviewer as a Code session or a Chat agent; any agent name; #direct', 
     seedMessage(w, 'direct', { from: 'reviewer', to: 'maintainer', kind: 'answer', body: 'All four PRs reviewed.', at: T0 - 1000, hex: 'dir001' })
     await start($)
     expect(w.status()).toBe('comms (maintainer): nothing awaiting approval')
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.press({ key: 'ch:direct' })
     expect(await ui.find({ type: 'Text', text: /#direct \(you\) ↔ reviewer/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /reviewer: Code session/ })).toBeDefined()
@@ -1485,7 +1485,7 @@ describe('reviewer as a Code session or a Chat agent; any agent name; #direct', 
     seedMessage(w, 'direct', { from: 'maintainer', to: 'reviewer', kind: 'note', body: 'private', at: T0 - 1000, hex: 'dir002' })
     await start($)
     expect(w.lists.some(p => p.includes('/channels/direct/'))).toBe(false)
-    const r = await $.tool.call({ tool: 'mcp__agent-comms__comms_read', channel: 'direct' })
+    const r = await $.tool.call({ tool: 'mcp__comms__comms_read', channel: 'direct' })
     expect(denial(r)).toContain('not a member')
   })
 
@@ -1512,7 +1512,7 @@ describe('Windows (the plugin on a PC)', () => {
   test('the default folder is %USERPROFILE%\\agent-comms; messages are written there with no program run', async ($, on) => {
     const w = world(on, { identity: '358', windows: true })
     await start($)
-    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'report', text: 'built on Windows' })
+    const posted = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'report', text: 'built on Windows' })
     expect(denial(posted)).toBeUndefined()
     const [path] = [...w.files.keys()].filter(p => p.startsWith(`${winMsg('358')}/`))
     expect(parse(w.files.get(path ?? '') ?? '', nameOf(path ?? '').slice(0, -5))).toMatchObject({ ok: true })
@@ -1554,7 +1554,7 @@ describe('Windows (the plugin on a PC)', () => {
 
 describe('audit fixes (2026-10-14)', () => {
   const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
-    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+    $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
   const filesIn = (w: World, ch: string) =>
     [...w.files.entries()]
       .filter(([p]) => p.startsWith(`${msgDir(ch)}/`))
@@ -1619,7 +1619,7 @@ describe('audit fixes (2026-10-14)', () => {
     w.store.delete(`identity:${SID}`) // another session ran /comms-as 358, which retires this claim
     await w.clock.advance(15_000)
     expect(w.status()).toBe('comms: 358 was taken by another session (/comms-as 358 here to take it back)')
-    const read = await $.tool.call({ tool: 'mcp__agent-comms__comms_read' })
+    const read = await $.tool.call({ tool: 'mcp__comms__comms_read' })
     expect(denial(read)).toContain('has not joined')
   })
 
@@ -1676,7 +1676,7 @@ describe('audit fixes (2026-10-14)', () => {
     await start($)
     const joined = await $.command.run({ command: 'comms-as', args: 'alpha', ...PERSON })
     expect(joined.text).toContain('Registered alpha')
-    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'report', text: 'done' })
+    const posted = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'report', text: 'done' })
     expect(denial(posted)).toBeUndefined()
     expect(filesIn(w, 'alpha').some(m => m.body === 'done')).toBe(true)
     expect(filesIn(w, 'team').some(m => m.body === 'done')).toBe(false)
@@ -1706,7 +1706,7 @@ describe('audit fixes (2026-10-14)', () => {
     await start($)
     await turn($, 1)
     const text = w.appended.find(t => t.includes('ungated ruling')) ?? ''
-    expect(text.split('\n')[1]).toBe('Delivered by agent-comms.')
+    expect(text.split('\n')[1]).toBe('Delivered by comms.')
   })
 
   test('a reviewer\'s message to another reviewer needs no approval and is delivered', async ($, on) => {
@@ -1727,7 +1727,7 @@ describe('audit fixes (2026-10-14)', () => {
     const ends = [...text.matchAll(/^----- end of message ([0-9a-f]{12}) -----$/gm)]
     expect(ends).toHaveLength(1)
     expect(text.trimEnd().endsWith(ends[0]?.[0] ?? '?')).toBe(true)
-    expect(text.split('\n')[1]).toBe('Delivered by agent-comms.')
+    expect(text.split('\n')[1]).toBe('Delivered by comms.')
   })
 
   test('with the store full, a delivered message is appended once, not at every step', async ($, on) => {
@@ -1756,7 +1756,7 @@ describe('audit fixes (2026-10-14)', () => {
     const w = world(on, { identity: '358' })
     seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'for the main loop', at: T0 - 1000, hex: 'aud018' })
     await start($)
-    const r = await $.tool.call({ tool: 'mcp__agent-comms__comms_read', agentId: 'sub-1' })
+    const r = await $.tool.call({ tool: 'mcp__comms__comms_read', agentId: 'sub-1' })
     expect(denial(r)).toContain('main conversation')
     await turn($, 1)
     expect(w.appended.some(t => t.includes('for the main loop'))).toBe(true)
@@ -1765,7 +1765,7 @@ describe('audit fixes (2026-10-14)', () => {
   test('an agent can write to the maintainer', async ($, on) => {
     const w = world(on, { identity: '358' })
     await start($)
-    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'maintainer', kind: 'question', text: 'may I merge?' })
+    const posted = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'maintainer', kind: 'question', text: 'may I merge?' })
     expect(denial(posted)).toBeUndefined()
     expect(filesIn(w, '358').some(m => m.to === 'maintainer' && m.body === 'may I merge?')).toBe(true)
   })
@@ -2043,7 +2043,7 @@ describe('audit fixes (2026-10-14)', () => {
 
 describe('second review fixes (2026-10-14)', () => {
   const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
-    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+    $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
   const filesIn = (w: World, ch: string) =>
     [...w.files.entries()]
       .filter(([p]) => p.startsWith(`${msgDir(ch)}/`))
@@ -2189,7 +2189,7 @@ describe('second review fixes (2026-10-14)', () => {
   test('a reviewer\'s message to the maintainer goes to #direct, not the first agent channel', async ($, on) => {
     const w = world(on, { identity: 'reviewer', config: WITH_DIRECT })
     await start($)
-    const posted = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'maintainer', kind: 'question', text: 'a word?' })
+    const posted = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'maintainer', kind: 'question', text: 'a word?' })
     expect(denial(posted)).toBeUndefined()
     expect(filesIn(w, 'direct').some(m => m.body === 'a word?')).toBe(true)
     expect(filesIn(w, '358').some(m => m.body === 'a word?')).toBe(false)
@@ -2313,7 +2313,7 @@ describe('second review fixes (2026-10-14)', () => {
     const w = world(on, { identity: '358', noHome: true, config: null })
     put(w, '/channels.json', JSON.stringify(DEFAULT_CONFIG))
     await start($)
-    const r = await $.tool.call({ tool: 'mcp__agent-comms__comms_post', to: 'reviewer', kind: 'note', text: 'x' })
+    const r = await $.tool.call({ tool: 'mcp__comms__comms_post', to: 'reviewer', kind: 'note', text: 'x' })
     expect(denial(r)).toContain('no home folder')
     expect([...w.files.keys()].some(p => p.startsWith('/channels/'))).toBe(false)
   })
@@ -2372,7 +2372,7 @@ describe('second review fixes (2026-10-14)', () => {
 
 describe('third review fixes (2026-10-14)', () => {
   const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
-    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+    $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
   const FOLDER = ROOT.slice(ROOT.lastIndexOf('/') + 1)
   const DENIED = 'written only through'
 
@@ -2482,7 +2482,7 @@ describe('third review fixes (2026-10-14)', () => {
 
 describe('fourth review fixes (2026-10-14)', () => {
   const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
-    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+    $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
   const FOLDER = ROOT.slice(ROOT.lastIndexOf('/') + 1)
   const DENIED = 'written only through'
   const filesIn = (w: World, ch: string) =>
@@ -2534,7 +2534,7 @@ describe('fourth review fixes (2026-10-14)', () => {
     const w = world(on, { identity: '358' })
     seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'read by the tool', at: T0 - 1000, hex: 'e20001' })
     await start($)
-    const read = await $.tool.call({ tool: 'mcp__agent-comms__comms_read', channel: '358' })
+    const read = await $.tool.call({ tool: 'mcp__comms__comms_read', channel: '358' })
     expect(String(read.result)).toContain('read by the tool')
     w.results.push(String(read.result))
     await turn($, 1)
@@ -2647,7 +2647,7 @@ describe('fourth review fixes (2026-10-14)', () => {
 
 describe('fifth review fixes (2026-10-14)', () => {
   const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
-    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+    $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
   const filesIn = (w: World, ch: string) =>
     [...w.files.entries()]
       .filter(([p]) => p.startsWith(`${msgDir(ch)}/`))
@@ -2771,7 +2771,7 @@ describe('fifth review fixes (2026-10-14)', () => {
 
 describe('sixth review fixes (2026-10-14)', () => {
   const mount = ($: Engine, surface: 'terminal' | 'desktop' | 'mobile' = 'desktop', bodyRows = 60) =>
-    $.ui.mount({ plugin: 'agent-comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
+    $.ui.mount({ plugin: 'comms', surface, component: 'Pane', requestId: 'comms', props: { ...PANE_PROPS, scroll: { offset: 0, bodyRows } } })
   const filesIn = (w: World, ch: string) =>
     [...w.files.entries()]
       .filter(([p]) => p.startsWith(`${msgDir(ch)}/`))
@@ -2848,10 +2848,10 @@ describe('directory review fixes (2026-10-14)', () => {
     const w = world(on, { identity: 'maintainer' })
     seedMessage(w, '354', { from: 'reviewer', to: '354', body: 'on 354', at: T0 - 1000, hex: 'd10001' })
     await start($)
-    const ui = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const ui = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     await ui.press({ key: 'ch:354' })
     await ui.unmount()
-    const again = await $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    const again = await $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
     expect(await again.find({ type: 'Text', text: /on 354/ })).toBeDefined()
     await again.unmount()
   })
@@ -2859,7 +2859,7 @@ describe('directory review fixes (2026-10-14)', () => {
 
 describe('deleting a thread (2026-11-06)', () => {
   const mount = ($: Engine) =>
-    $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
   const tabs = async (ui: { findAll: (q: { type: string }) => Promise<{ key?: string; text: string }[]> }) =>
     (await ui.findAll({ type: 'Button' })).map(b => b.text).filter(t => t.startsWith('#'))
   const channelIds = (w: World) => (JSON.parse(w.files.get(`${ROOT}/channels.json`) ?? '{}') as { channels: { id: string }[] }).channels.map(c => c.id)
@@ -2937,14 +2937,14 @@ describe('deleting a thread (2026-11-06)', () => {
     await start($)
     await turn($, 1)
     expect(w.appended.some(t => t.includes('after the delete'))).toBe(false)
-    const read = await $.tool.call({ tool: 'mcp__agent-comms__comms_read' })
+    const read = await $.tool.call({ tool: 'mcp__comms__comms_read' })
     expect(denial(read) ?? String(read.result)).not.toContain('after the delete')
   })
 })
 
 describe('deleting a thread: review fixes (2026-11-06)', () => {
   const mount = ($: Engine) =>
-    $.ui.mount({ plugin: 'agent-comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
+    $.ui.mount({ plugin: 'comms', surface: 'desktop', component: 'Pane', requestId: 'comms', props: PANE_PROPS })
   const without358 = { ...DEFAULT_CONFIG, channels: DEFAULT_CONFIG.channels.filter(c => c.id !== '358') }
   const markOf = (w: World) => `${ROOT}/channels/358/deleted.json`
   const deletedWith = (w: World, files: string[]) =>
@@ -2976,7 +2976,7 @@ describe('deleting a thread: review fixes (2026-11-06)', () => {
     await turn($, 1)
     await turn($, 2)
     expect(w.appended.some(t => t.includes('OLD WORK'))).toBe(false)
-    expect(w.prompts.some(t => t.includes('new agent-comms message'))).toBe(false)
+    expect(w.prompts.some(t => t.includes('new comms message'))).toBe(false)
   })
 
   test('when channels.json cannot be changed, Delete says so and the thread stays as it was', async ($, on) => {
@@ -3010,5 +3010,40 @@ describe('deleting a thread: review fixes (2026-11-06)', () => {
     expect(await ui.find({ type: 'Text', text: /Not deleted: #Team shares its folder with #team/ })).toBeDefined()
     expect(w.files.has(`${ROOT}/channels/Team/deleted.json`)).toBe(false)
     await ui.unmount()
+  })
+})
+
+describe('renamed agent-comms → comms (2026-11-06)', () => {
+  test('a delivery made under the old [agent-comms] label is still found: a rewind check sends nothing again', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'delivered before the rename', nowMs: T0 - 5000, hex: 're0001' })
+    const oldStyle = deliveryText('358', m, false).replace('[comms] Message on channel', '[agent-comms] Message on channel')
+    const w = world(on, {
+      identity: '358',
+      messages: [oldStyle],
+      store: { 'delivered:S1:358': [m.id], 'recent:S1': [{ ch: '358', id: m.id }] },
+    })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    await start($)
+    await turn($, 1) // the turn count did not rise: the rewind check runs
+    expect(w.appended.filter(t => t.includes('delivered before the rename'))).toHaveLength(0)
+  })
+
+  test('installed from a marketplace, a session also takes its records from the renamed folder-loaded store (comms_inline)', async ($, on) => {
+    const m = newMessage({ from: 'maintainer', to: '358', kind: 'note', body: 'delivered by the folder-loaded comms', nowMs: T0 - 5000, hex: 're0002' })
+    const w = world(on, { host: 'local_B' })
+    put(w, `${msgDir('358')}/${m.id}.json`, format(m))
+    put(w, `${HOME}/.claude/plugins/store/comms_inline-0a1b2c3d4e5f.json`, JSON.stringify({ 'identity:local_B': '358', 'delivered:local_B:358': [m.id] }))
+    await start($)
+    await turn($, 1)
+    expect(w.tools).toContain('comms_post')
+    expect(w.appended.some(t => t.includes('delivered by the folder-loaded comms'))).toBe(false)
+  })
+
+  test('deliveries carry the new label', async ($, on) => {
+    const w = world(on, { identity: '358' })
+    seedMessage(w, '358', { from: 'maintainer', to: '358', kind: 'note', body: 'labelled', at: T0 - 1000, hex: 're0003' })
+    await start($)
+    await turn($, 1)
+    expect(w.appended.some(t => t.startsWith('[comms] Message on channel #358'))).toBe(true)
   })
 })

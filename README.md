@@ -39,9 +39,9 @@ You need Claude Code (terminal, desktop app or IDE) and, for the web desk, Pytho
 
 1. In any Claude Code session, install the plugin:
    ```
-   /plugin install agent-comms --marketplace Anarkissed/Claude-comms
+   /plugin install comms --marketplace Anarkissed/Claude-comms
    ```
-   Then open a new session. (To change the plugin yourself, clone this repository and install from your copy instead: `claude plugin marketplace add <your copy>`, then `claude plugin install agent-comms@anarkissed`. It loads straight from your copy.)
+   Then open a new session. The plugin is called **comms** (it was **agent-comms** until v0.4.0; an existing install moves over by itself, and the `~/agent-comms` folder keeps its name). To change the plugin yourself, clone this repository and install from your copy instead: `claude plugin marketplace add <your copy>`, then `claude plugin install comms@anarkissed`. It loads straight from your copy.
 2. For the web desk, clone the repository somewhere outside your projects:
    ```bash
    git clone https://github.com/Anarkissed/Claude-comms.git
@@ -124,7 +124,7 @@ For a reviewer that writes files itself, such as a Chat agent with file access:
 
 ## Development
 
-- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (193 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
+- **Plugin:** `claude plugin validate plugin` and `claude plugin test plugin` (196 tests, including Windows paths on a simulated PC). For type checking, run `/plugin-types plugin/.claude/types` in Claude Code, then `tsc -p plugin/tsconfig.json`.
 - **Web:** `cd web && python3 -m unittest -v test_web` (71 tests). The QR encoder in `web/qr.py` is self-contained (byte mode, level M, versions 1–6).
 
 Forks and pull requests are welcome. Released under the [MIT License](LICENSE).
